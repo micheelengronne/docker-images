@@ -38,7 +38,7 @@ jobs:
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ghcr.io/${{ github.repository_owner }}/images/${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -61,8 +61,8 @@ jobs:
             REVISION=${{ github.sha }}
             TARGETPLATFORM=${{ matrix.platform }}
           labels: |
-            org.opencontainers.image.title=webhook-dnsendpoint
-            org.opencontainers.image.url=https://ghcr.io/${{ github.repository_owner }}/images/webhook-dnsendpoint
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.url=https://ghcr.io/${{ github.repository_owner }}/images/${{ matrix.image }}
             org.opencontainers.image.version=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
@@ -75,6 +75,6 @@ jobs:
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
         with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          subject-name: ghcr.io/${{ github.repository_owner }}/images/${{ matrix.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
