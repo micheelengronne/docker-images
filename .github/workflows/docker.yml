@@ -20,6 +20,7 @@ jobs:
     strategy:
       matrix:
         image: [jool, wireguard]
+        platform: [amd64, arm64]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
@@ -34,8 +35,15 @@ jobs:
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch,suffix=-${{ matrix.platform }}
+            type=ref,event=pr,suffix=-${{ matrix.platform }}
+            type=semver,pattern={{version}},suffix=-${{ matrix.platform }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.platform }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -52,12 +60,17 @@ jobs:
             VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             REVISION=${{ github.sha }}
             TARGETPLATFORM=${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=webhook-dnsendpoint
+            org.opencontainers.image.url=https://ghcr.io/${{ github.repository_owner }}/images/webhook-dnsendpoint
+            org.opencontainers.image.version=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
           context: .
           file: ${{ matrix.image }}/Dockerfile
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
