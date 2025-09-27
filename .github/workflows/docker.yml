@@ -20,7 +20,6 @@ jobs:
     strategy:
       matrix:
         image: [jool, wireguard]
-        platform: [amd64, arm64]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
@@ -53,16 +52,16 @@ jobs:
         id: push
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
-          annotations: ${{ steps.meta.outputs.annotations }}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.url=https://ghcr.io/${{ github.repository_owner }}/images/${{ matrix.image }}
             org.opencontainers.image.version=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.description="${{ matrix.image }} image"
           context: .
           file: ${{ matrix.image }}/Dockerfile
-          platforms: linux/${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
           provenance: mode=max
           sbom: true
           push: true
