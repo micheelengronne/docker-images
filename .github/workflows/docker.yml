@@ -58,7 +58,6 @@ jobs:
             org.opencontainers.image.version=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.description="${{ matrix.image }} image"
           context: .
           file: ${{ matrix.image }}/Dockerfile
           platforms: linux/amd64,linux/arm64
