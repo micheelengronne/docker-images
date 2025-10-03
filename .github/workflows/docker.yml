@@ -19,7 +19,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        image: [jool, wireguard]
+        image: [jool, jool_prom_exporter]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
