@@ -1,8 +1,11 @@
 #!/bin/bash
 
+set -Eeuo pipefail
+
 apt-get update
 apt-get install -y linux-headers-$(uname -r) --no-install-recommends
 echo 'jool kernel module is compiled'
+modprobe -r jool
 modprobe jool
 echo 'jool kernel module is enabled'
 
