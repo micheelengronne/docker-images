@@ -2,10 +2,13 @@
 
 set -Eeuo pipefail
 
+rmmod jool_common
+rmmod jool
+rmmod jool_siit
+
 apt-get update
 apt-get install -y linux-headers-$(uname -r) --no-install-recommends
 echo 'jool kernel module is compiled'
-modprobe -r jool
 modprobe jool
 echo 'jool kernel module is enabled'
 
