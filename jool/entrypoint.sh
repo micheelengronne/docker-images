@@ -2,9 +2,9 @@
 
 set -Eeuo pipefail
 
-rmmod jool_common
-rmmod jool
-rmmod jool_siit
+rmmod jool_common || true
+rmmod jool || true
+rmmod jool_siit || true
 
 apt-get update
 apt-get install -y linux-headers-$(uname -r) --no-install-recommends
