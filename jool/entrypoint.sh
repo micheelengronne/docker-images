@@ -12,9 +12,12 @@ echo 'jool kernel module is compiled'
 modprobe jool
 echo 'jool kernel module is enabled'
 
-if [[ $(/usr/bin/jool instance display) != *${JOOL_INSTANCE:-default}* ]];
+# Reattach the instance
+if [[ $(/usr/bin/jool instance display) == *${JOOL_INSTANCE:-default}* ]];
 then
-    /usr/bin/jool instance add ${JOOL_INSTANCE:-default} --netfilter --pool6 64:ff9b::/96;
+    /usr/bin/jool instance remove ${JOOL_INSTANCE:-default}
 fi
+
+/usr/bin/jool instance add ${JOOL_INSTANCE:-default} --netfilter --pool6 64:ff9b::/96;
 
 echo "jool ${JOOL_INSTANCE:-default} instance configured"
