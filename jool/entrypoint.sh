@@ -8,9 +8,11 @@ rmmod jool_siit || true
 
 apt-get update
 apt-get install -y linux-headers-$(uname -r) --no-install-recommends
-echo 'jool kernel module is compiled'
+echo 'jool and jool_siit kernel modules are compiled'
 modprobe jool
 echo 'jool kernel module is enabled'
+modprobe jool_siit
+echo 'jool_siit kernel module is enabled'
 
 # Reattach the nat64 instance
 if [[ $(/usr/bin/jool instance display) == *${JOOL_INSTANCE:-defaultnat64}* ]];
