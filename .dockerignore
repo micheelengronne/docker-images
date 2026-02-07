@@ -1,3 +1,5 @@
 **
 !jool_prom_exporter/requirements.txt
 !jool/entrypoint.sh
+!jool/requirements.txt
+!jool/jool_eam_manager.py
