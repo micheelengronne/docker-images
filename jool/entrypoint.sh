@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 cd /usr/local/src/build/jool
-./configure --disable-iptables
+./configure
 make
 cp src/mod/common/*.ko /lib/modules/$(uname -r)/extra/jool/
 cp src/mod/siit/*.ko /lib/modules/$(uname -r)/extra/jool/
