@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 
 echo "This script expects that the kernel-headers from the host are mounted in /usr/src"
-ln -s /usr/src/linux-headers-$(uname -r)  /lib/modules/$(uname -r)/build
+rm -Rf /lib/modules/$(uname -r)/build
+ln -s /usr/src/linux-headers-$(uname -r) /lib/modules/$(uname -r)/build
 
 cd /usr/local/src/build
 dkms build jool
