@@ -1,6 +1,6 @@
-FROM docker.io/ubuntu:24.04
+FROM docker.io/python:3.13.7-trixie
 
-LABEL org.opencontainers.image.description="Jool image for nat64"
+LABEL org.opencontainers.image.description="Jool image for nat64 and siit"
 
 # datasource=github-releases depName=NICMx/Jool
 ENV JOOL_VERSION=4.1.15

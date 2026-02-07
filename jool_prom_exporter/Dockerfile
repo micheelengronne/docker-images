@@ -1,5 +1,7 @@
 FROM docker.io/python:3.13.7-trixie
 
+LABEL org.opencontainers.image.description="Jool exporter image for monitoring"
+
 WORKDIR /usr/local/src
 
 RUN apt-get update \
