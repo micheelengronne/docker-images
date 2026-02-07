@@ -9,7 +9,7 @@ ADD "https://github.com/NICMx/Jool/releases/download/v${JOOL_VERSION}/jool-${JOO
 
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y libnl-genl-3-dev libxtables-dev pkg-config build-essential --no-install-recommends \
+    && apt-get install -y dkms zstd gcc-13 libnl-genl-3-dev libxtables-dev pkg-config build-essential --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /usr/local/src/build \
