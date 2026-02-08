@@ -19,7 +19,7 @@ jobs:
       id-token: write
     strategy:
       matrix:
-        image: [jool, jool_prom_exporter]
+        image: [jool, jool_prom_exporter, jool_ubuntu_2404]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5
