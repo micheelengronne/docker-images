@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chmod=555 jool/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=555 jool_ubuntu_2404/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=555 jool/jool_eam_manager.py /usr/local/bin/jool_eam_manager.py
 
 COPY jool/requirements.txt ./
