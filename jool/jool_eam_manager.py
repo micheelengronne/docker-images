@@ -3,9 +3,9 @@
 Jool SIIT/NAT64 EAM (Explicit Address Mapping) Manager
 
 This script manages Jool SIIT and NAT64 instances and IPv4-IPv6 EAM mappings in an idempotent manner.
-It is designed as a Python replacement for the bash entrypoint.sh script.
 
 Features:
+- Sets up kernel modules (jool, jool_siit)
 - Creates Jool SIIT or NAT64 instance if not exists
 - Manages EAM mappings from YAML configuration (SIIT mode only)
 - Idempotent: removes mappings not in config, adds missing ones
@@ -18,9 +18,117 @@ import sys
 import yaml
 import logging
 import os
+import ipaddress
 from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def ipv4_to_ipv6_embedded(ipv4_addr: str, ipv6_prefix: str) -> str:
+    """
+    Convert an IPv4 address to an IPv6 address by embedding it in a prefix.
+
+    This function supports several embedding methods:
+    - Standard embedding: Concatenate IPv4 octets to IPv6 prefix
+    - Well-known prefix: 64:ff9b::/96 + IPv4
+
+    Args:
+        ipv4_addr: IPv4 address (e.g., "192.0.2.1" or "192.0.2.1/32")
+        ipv6_prefix: IPv6 prefix (e.g., "2001:db8::/96" or "64:ff9b::/96")
+
+    Returns:
+        Full IPv6 address with embedded IPv4
+
+    Example:
+        ipv4_to_ipv6_embedded("192.0.2.1", "2001:db8::/96")
+        -> "2001:db8::c000:201"  (192=0xC0, 0=0x00, 2=0x02, 1=0x01)
+    """
+    # Parse IPv4 address (remove prefix if present)
+    ipv4_str = ipv4_addr.split('/')[0]
+    ipv4_obj = ipaddress.IPv4Address(ipv4_str)
+
+    # Parse IPv6 prefix
+    ipv6_net = ipaddress.IPv6Network(ipv6_prefix, strict=False)
+    prefix_len = ipv6_net.prefixlen
+
+    # Convert IPv4 to 32-bit integer
+    ipv4_int = int(ipv4_obj)
+
+    # Get the prefix as an integer
+    prefix_int = int(ipv6_net.network_address)
+
+    # Calculate how many bits we need to shift the IPv4 address
+    # For /96 prefix, we shift left by 32 bits (128 - 96 - 32 = 0, so shift right by 0)
+    # For /64 prefix, we shift left by 64 bits (128 - 64 - 32 = 32, so shift right by 0, left by 32)
+    shift_bits = 128 - prefix_len - 32
+
+    if shift_bits < 0:
+        raise ValueError(f"IPv6 prefix /{prefix_len} is too long to embed IPv4 address")
+
+    # Create the full IPv6 address by combining prefix and IPv4
+    ipv6_int = prefix_int | (ipv4_int << shift_bits)
+    ipv6_addr = ipaddress.IPv6Address(ipv6_int)
+
+    return str(ipv6_addr)
+
+
+def parse_eam_mapping(ipv4: str, ipv6: str, auto_convert: bool = False) -> Tuple[str, str]:
+    """
+    Parse and optionally convert EAM mapping entries.
+
+    Args:
+        ipv4: IPv4 address or prefix
+        ipv6: IPv6 address/prefix or "auto" for automatic conversion
+        auto_convert: Enable automatic conversion when ipv6="auto"
+
+    Returns:
+        Tuple of (ipv4_formatted, ipv6_formatted)
+
+    Examples:
+        parse_eam_mapping("192.0.2.1", "2001:db8::1")
+        -> ("192.0.2.1", "2001:db8::1")
+
+        parse_eam_mapping("192.0.2.1", "auto:2001:db8::/96", auto_convert=True)
+        -> ("192.0.2.1", "2001:db8::c000:201")
+
+        parse_eam_mapping("192.0.2.0/24", "auto:2001:db8::/96", auto_convert=True)
+        -> ("192.0.2.0/24", "2001:db8::/120")
+    """
+    ipv4_clean = ipv4.strip()
+    ipv6_clean = ipv6.strip()
+
+    # Check if IPv6 is set to auto-convert
+    if ipv6_clean.startswith("auto:") or ipv6_clean.lower() == "auto":
+        if not auto_convert:
+            raise ValueError(f"Auto-conversion requested for {ipv4} but auto_convert is disabled")
+
+        # Extract prefix if provided
+        if ipv6_clean.startswith("auto:"):
+            prefix = ipv6_clean[5:].strip()
+        else:
+            # Use default well-known prefix
+            prefix = "64:ff9b::/96"
+
+        # Check if it's a network or single address
+        if '/' in ipv4_clean:
+            # It's a network - convert to IPv6 network
+            ipv4_net = ipaddress.IPv4Network(ipv4_clean, strict=False)
+            ipv6_prefix_net = ipaddress.IPv6Network(prefix, strict=False)
+
+            # Calculate the IPv6 prefix length
+            # IPv4 prefix bits + IPv6 prefix length
+            ipv4_prefix_len = ipv4_net.prefixlen
+            ipv6_base_prefix_len = ipv6_prefix_net.prefixlen
+            ipv6_final_prefix_len = ipv6_base_prefix_len + ipv4_prefix_len
+
+            # Get the base address by embedding the network address
+            base_ipv6 = ipv4_to_ipv6_embedded(str(ipv4_net.network_address), prefix)
+            ipv6_clean = f"{base_ipv6}/{ipv6_final_prefix_len}"
+        else:
+            # Single address
+            ipv6_clean = ipv4_to_ipv6_embedded(ipv4_clean, prefix)
+
+    return ipv4_clean, ipv6_clean
 
 
 @dataclass
@@ -140,8 +248,11 @@ class JoolSIITManager:
 
             # Add pool6 only if specified
             if self.pool6:
-                cmd.extend(["--pool6", self.pool6])
-                self.logger.info(f"Using pool6: {self.pool6}")
+                # Strip any surrounding quotes
+                pool6_clean = self.pool6.strip().strip("'").strip('"')
+                cmd.extend(["--pool6", pool6_clean])
+                self.logger.info(f"Using pool6: {pool6_clean}")
+                self.logger.debug(f"pool6 value: [{pool6_clean}] (type: {type(pool6_clean).__name__})")
             else:
                 self.logger.info("No pool6 specified (relying on EAM only)")
 
@@ -249,12 +360,13 @@ class JoolSIITManager:
             self.logger.error(f"Failed to remove mapping {mapping}: {e}")
             return False
 
-    def load_config(self, config_path: str) -> Set[EAMMapping]:
+    def load_config(self, config_path: str, auto_convert: bool = True) -> Set[EAMMapping]:
         """
         Load desired mappings from YAML config file
 
         Args:
             config_path: Path to YAML config file
+            auto_convert: Enable automatic IPv6 address generation from IPv4
 
         Returns:
             Set of desired EAM mappings
@@ -276,13 +388,18 @@ class JoolSIITManager:
 
         # Support multiple config formats
         mapping_list = None
+        default_prefix = None
 
         if 'eam_mappings' in config:
             mapping_list = config['eam_mappings']
+            # Check for global auto_convert_prefix
+            default_prefix = config.get('auto_convert_prefix', '64:ff9b::/96')
         elif 'mappings' in config:
             mapping_list = config['mappings']
+            default_prefix = config.get('auto_convert_prefix', '64:ff9b::/96')
         elif isinstance(config, list):
             mapping_list = config
+            default_prefix = '64:ff9b::/96'
         else:
             raise ValueError("Config must contain 'eam_mappings', 'mappings' key, or be a list")
 
@@ -299,8 +416,24 @@ class JoolSIITManager:
                     self.logger.warning(f"Skipping invalid mapping: {item}")
                     continue
 
-                mappings.add(EAMMapping(ipv4, ipv6))
-                self.logger.debug(f"Loaded mapping: {ipv4} <-> {ipv6}")
+                # Handle auto-conversion
+                try:
+                    # If ipv6 is "auto", use the default prefix
+                    if ipv6.lower() == 'auto':
+                        ipv6 = f"auto:{default_prefix}"
+
+                    ipv4_final, ipv6_final = parse_eam_mapping(ipv4, ipv6, auto_convert=auto_convert)
+
+                    mappings.add(EAMMapping(ipv4_final, ipv6_final))
+
+                    if ipv6.startswith('auto'):
+                        self.logger.info(f"Auto-converted: {ipv4} -> {ipv4_final} <-> {ipv6_final}")
+                    else:
+                        self.logger.debug(f"Loaded mapping: {ipv4_final} <-> {ipv6_final}")
+
+                except ValueError as e:
+                    self.logger.error(f"Error processing mapping {ipv4} <-> {ipv6}: {e}")
+                    continue
             else:
                 self.logger.warning(f"Skipping invalid mapping format: {item}")
 
@@ -359,6 +492,7 @@ class JoolNAT64Manager:
         self,
         instance_name: str = "defaultnat64",
         pool6: str = "64:ff9b::/96",
+        pool4: Optional[str] = None,
         dry_run: bool = False
     ):
         """
@@ -367,10 +501,12 @@ class JoolNAT64Manager:
         Args:
             instance_name: Name of the Jool NAT64 instance
             pool6: IPv6 pool for the instance (required for NAT64)
+            pool4: IPv4 pool for the instance (optional, e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
             dry_run: If True, only show what would be done without making changes
         """
         self.instance_name = instance_name
         self.pool6 = pool6
+        self.pool4 = pool4
         self.dry_run = dry_run
         self.logger = logging.getLogger(__name__)
 
@@ -442,17 +578,129 @@ class JoolNAT64Manager:
 
         self.logger.info(f"Creating jool NAT64 instance '{self.instance_name}'")
 
+        # Strip any surrounding quotes from pool6
+        pool6_clean = self.pool6.strip().strip("'").strip('"')
+        self.logger.debug(f"pool6 value: [{pool6_clean}] (type: {type(pool6_clean).__name__})")
+
         try:
             self.run_command([
                 "jool", "instance", "add",
                 self.instance_name,
                 "--netfilter",
-                "--pool6", self.pool6
+                "--pool6", pool6_clean
             ])
-            self.logger.info(f"jool NAT64 instance '{self.instance_name}' configured with pool6: {self.pool6}")
+            self.logger.info(f"jool NAT64 instance '{self.instance_name}' configured with pool6: {pool6_clean}")
+
+            # Add pool4 if specified
+            if self.pool4:
+                self.add_pool4(self.pool4)
+
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Failed to create NAT64 instance: {e}")
             raise
+
+    def add_pool4(self, pool4: str):
+        """
+        Add IPv4 pool to the NAT64 instance
+
+        Args:
+            pool4: IPv4 pool specification (e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
+        """
+        pool4_clean = pool4.strip().strip("'").strip('"')
+        self.logger.info(f"Adding pool4: {pool4_clean}")
+
+        try:
+            self.run_command([
+                "jool", "-i", self.instance_name,
+                "pool4", "add",
+                pool4_clean
+            ])
+            self.logger.info(f"Successfully added pool4: {pool4_clean}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to add pool4 {pool4_clean}: {e}")
+            raise
+
+    def get_pool4_entries(self) -> Set[str]:
+        """
+        Retrieve current pool4 entries from Jool NAT64
+
+        Returns:
+            Set of current pool4 entries
+        """
+        self.logger.info("Retrieving current pool4 entries from Jool NAT64")
+
+        try:
+            result = self.run_command(
+                ["jool", "-i", self.instance_name, "pool4", "display"],
+                check=False
+            )
+        except subprocess.CalledProcessError:
+            self.logger.warning("Could not retrieve pool4 entries, assuming empty")
+            return set()
+
+        entries = set()
+        lines = result.stdout.strip().split('\n')
+
+        # Parse output
+        for line in lines:
+            line = line.strip()
+
+            # Skip empty lines, headers, and separators
+            if not line or line.startswith('-') or line.startswith('='):
+                continue
+            if 'Mark' in line or 'Protocol' in line or 'Address' in line:
+                continue
+
+            # Try to extract pool4 entries
+            # Format varies, but usually contains IP addresses or ranges
+            parts = line.split()
+            for part in parts:
+                # Look for IP addresses or CIDR notation
+                if '.' in part and ('/' in part or '-' in part or part.replace('.', '').replace('-', '').isdigit()):
+                    entries.add(part.strip())
+                    self.logger.debug(f"Found pool4 entry: {part}")
+
+        self.logger.info(f"Found {len(entries)} pool4 entries")
+        return entries
+
+    def remove_pool4(self, pool4: str):
+        """
+        Remove IPv4 pool from the NAT64 instance
+
+        Args:
+            pool4: IPv4 pool specification to remove
+        """
+        self.logger.info(f"Removing pool4: {pool4}")
+
+        try:
+            self.run_command([
+                "jool", "-i", self.instance_name,
+                "pool4", "remove",
+                pool4
+            ])
+            self.logger.info(f"Successfully removed pool4: {pool4}")
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to remove pool4 {pool4}: {e}")
+            # Don't raise - pool4 might already be gone
+            return False
+        return True
+
+    def flush_pool4(self):
+        """Flush all pool4 entries"""
+        self.logger.info("Flushing all pool4 entries")
+
+        try:
+            self.run_command([
+                "jool", "-i", self.instance_name,
+                "pool4", "flush"
+            ])
+            self.logger.info("Successfully flushed pool4")
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Failed to flush pool4: {e}")
+            # Try to remove entries individually
+            entries = self.get_pool4_entries()
+            for entry in entries:
+                self.remove_pool4(entry)
 
     def setup(self):
         """
@@ -485,6 +733,7 @@ Environment Variables:
   JOOL_INSTANCE_SIIT   SIIT instance name (default: defaultnat46)
   JOOL_INSTANCE_NAT64  NAT64 instance name (default: defaultnat64)
   JOOL_POOL6           IPv6 pool (default: 64:ff9b::/96 for NAT64, optional for SIIT)
+  JOOL_POOL4           IPv4 pool for NAT64 (optional, e.g., "192.0.2.0/24" or "192.0.2.1-192.0.2.10")
   EAM_CONFIG_FILE      Path to EAM config YAML file (only for SIIT mode)
 
 Examples:
@@ -536,6 +785,10 @@ Examples:
         help='IPv6 pool (default: from JOOL_POOL6 or "64:ff9b::/96", optional for SIIT)'
     )
     parser.add_argument(
+        '--pool4',
+        help='IPv4 pool for NAT64 (e.g., "192.0.2.0/24" or "192.0.2.1-192.0.2.10", default: from JOOL_POOL4)'
+    )
+    parser.add_argument(
         '--no-pool6',
         action='store_true',
         help='Do not use pool6 for SIIT (EAM only mode)'
@@ -572,6 +825,7 @@ Examples:
             instance_name = os.environ.get('JOOL_INSTANCE_SIIT', 'defaultnat46')
 
         default_pool6 = os.environ.get('JOOL_POOL6')  # Optional for SIIT
+        pool4 = None  # SIIT doesn't use pool4
     else:  # nat64
         config_path = None  # NAT64 doesn't use EAM config
 
@@ -585,11 +839,19 @@ Examples:
 
         default_pool6 = os.environ.get('JOOL_POOL6', '64:ff9b::/96')  # Required for NAT64
 
+        # Pool4 for NAT64
+        pool4 = args.pool4 or os.environ.get('JOOL_POOL4')
+        if pool4:
+            pool4 = pool4.strip().strip("'").strip('"')
+
     # Handle pool6
     if args.no_pool6:
         pool6 = None
     else:
         pool6 = args.pool6 or default_pool6
+        # Strip any surrounding quotes that might have been added accidentally
+        if pool6:
+            pool6 = pool6.strip().strip("'").strip('"')
 
     # Validate config for SIIT mode
     if mode == 'siit' and not config_path:
@@ -605,6 +867,8 @@ Examples:
             logger.info(f"Pool6: {pool6}")
         else:
             logger.info("Pool6: None (EAM only)")
+        if mode == 'nat64' and pool4:
+            logger.info(f"Pool4: {pool4}")
         if config_path:
             logger.info(f"Config: {config_path}")
         if args.dry_run:
@@ -646,6 +910,7 @@ Examples:
             manager = JoolNAT64Manager(
                 instance_name=instance_name,
                 pool6=pool6,
+                pool4=pool4,
                 dry_run=args.dry_run
             )
 
@@ -654,6 +919,8 @@ Examples:
 
             logger.info("=" * 60)
             logger.info("NAT64 instance setup complete!")
+            if pool4:
+                logger.info(f"Pool4 configured: {pool4}")
             logger.info("=" * 60)
 
         if args.dry_run:
