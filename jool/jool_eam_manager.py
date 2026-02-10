@@ -504,14 +504,14 @@ class JoolNAT64Manager:
             instance_name: Name of the Jool NAT64 instance
             pool6: IPv6 pool for the instance (required for NAT64)
             pool4: IPv4 pool for the instance (optional, e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
-            pool4_protocols: Protocols for pool4 (default: ['tcp', 'udp', 'icmp'])
+            pool4_protocols: Protocols for pool4 (default: ['tcp', 'udp'])
             pool4_port_range: Port range for TCP/UDP (default: "1-65535")
             dry_run: If True, only show what would be done without making changes
         """
         self.instance_name = instance_name
         self.pool6 = pool6
         self.pool4 = pool4
-        self.pool4_protocols = pool4_protocols or ['tcp', 'udp', 'icmp']
+        self.pool4_protocols = pool4_protocols or ['tcp', 'udp']
         self.pool4_port_range = pool4_port_range
         self.dry_run = dry_run
         self.logger = logging.getLogger(__name__)
@@ -611,14 +611,14 @@ class JoolNAT64Manager:
 
         Args:
             pool4: IPv4 pool specification (e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
-            protocols: List of protocols to configure (default: ['tcp', 'udp', 'icmp'])
+            protocols: List of protocols to configure (default: ['tcp', 'udp'])
             port_range: Port range for TCP/UDP (default: "1-65535")
         """
         pool4_clean = pool4.strip().strip("'").strip('"')
 
         # Default protocols if not specified
         if protocols is None:
-            protocols = ['tcp', 'udp', 'icmp']
+            protocols = ['tcp', 'udp']
 
         self.logger.info(f"Adding pool4: {pool4_clean} for protocols: {', '.join(protocols)}")
 
@@ -639,9 +639,6 @@ class JoolNAT64Manager:
                     cmd.append("--udp")
                     cmd.append(pool4_clean)
                     cmd.append(port_range)
-                elif protocol.lower() == 'icmp':
-                    cmd.append("--icmp")
-                    cmd.append(pool4_clean)
                 else:
                     self.logger.warning(f"Unknown protocol: {protocol}, skipping")
                     continue
@@ -767,7 +764,7 @@ Environment Variables:
   JOOL_INSTANCE_NAT64    NAT64 instance name (default: defaultnat64)
   JOOL_POOL6             IPv6 pool (default: 64:ff9b::/96 for NAT64, optional for SIIT)
   JOOL_POOL4             IPv4 pool for NAT64 (optional, e.g., "192.0.2.0/24" or "192.0.2.1-192.0.2.10")
-  JOOL_POOL4_PROTOCOLS   Comma-separated protocols (default: tcp,udp,icmp)
+  JOOL_POOL4_PROTOCOLS   Comma-separated protocols (default: tcp,udp)
   JOOL_POOL4_PORT_RANGE  Port range for TCP/UDP (default: 1-65535)
   EAM_CONFIG_FILE        Path to EAM config YAML file (only for SIIT mode)
 
@@ -835,8 +832,8 @@ Examples:
     parser.add_argument(
         '--pool4-protocols',
         nargs='+',
-        choices=['tcp', 'udp', 'icmp'],
-        help='Protocols for pool4 (default: tcp udp icmp)'
+        choices=['tcp', 'udp'],
+        help='Protocols for pool4 (default: tcp udp)'
     )
     parser.add_argument(
         '--pool4-port-range',
@@ -899,7 +896,7 @@ Examples:
         if pool4:
             pool4 = pool4.strip().strip("'").strip('"')
 
-        # Pool4 protocols (default: tcp, udp, icmp)
+        # Pool4 protocols (default: tcp, udp)
         pool4_protocols = args.pool4_protocols
         if not pool4_protocols:
             # Check environment variable
@@ -907,7 +904,7 @@ Examples:
             if env_protocols:
                 pool4_protocols = [p.strip().lower() for p in env_protocols.split(',')]
             else:
-                pool4_protocols = ['tcp', 'udp', 'icmp']
+                pool4_protocols = ['tcp', 'udp']
 
         # Pool4 port range
         pool4_port_range = args.pool4_port_range or os.environ.get('JOOL_POOL4_PORT_RANGE', '1-65535')
