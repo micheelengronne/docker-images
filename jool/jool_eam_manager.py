@@ -5,12 +5,12 @@ Jool SIIT/NAT64 EAM (Explicit Address Mapping) Manager
 This script manages Jool SIIT and NAT64 instances and IPv4-IPv6 EAM mappings in an idempotent manner.
 
 Features:
-- Sets up kernel modules (jool, jool_siit)
 - Creates Jool SIIT or NAT64 instance if not exists
 - Manages EAM mappings from YAML configuration (SIIT mode only)
 - Idempotent: removes mappings not in config, adds missing ones
 - Supports both SIIT and NAT64 modes
 - Optional pool6 for SIIT (can work with EAM only)
+- Supports multiple pool4 entries with idempotent sync (NAT64)
 """
 
 import subprocess
@@ -147,6 +147,27 @@ class EAMMapping:
 
     def __str__(self):
         return f"{self.ipv4} <-> {self.ipv6}"
+
+
+@dataclass
+class Pool4Entry:
+    """Represents a pool4 entry with address, protocols, and port range"""
+    address: str
+    protocols: List[str]
+    port_range: str = "1-65535"
+
+    def __hash__(self):
+        return hash((self.address, tuple(sorted(self.protocols)), self.port_range))
+
+    def __eq__(self, other):
+        if not isinstance(other, Pool4Entry):
+            return False
+        return (self.address == other.address and
+                set(self.protocols) == set(other.protocols) and
+                self.port_range == other.port_range)
+
+    def __str__(self):
+        return f"{self.address} ({', '.join(self.protocols)}) ports {self.port_range}"
 
 
 class JoolSIITManager:
@@ -492,9 +513,7 @@ class JoolNAT64Manager:
         self,
         instance_name: str = "defaultnat64",
         pool6: str = "64:ff9b::/96",
-        pool4: Optional[str] = None,
-        pool4_protocols: Optional[List[str]] = None,
-        pool4_port_range: str = "1-65535",
+        pool4_entries: Optional[List[Pool4Entry]] = None,
         dry_run: bool = False
     ):
         """
@@ -503,16 +522,12 @@ class JoolNAT64Manager:
         Args:
             instance_name: Name of the Jool NAT64 instance
             pool6: IPv6 pool for the instance (required for NAT64)
-            pool4: IPv4 pool for the instance (optional, e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
-            pool4_protocols: Protocols for pool4 (default: ['tcp', 'udp'])
-            pool4_port_range: Port range for TCP/UDP (default: "1-65535")
+            pool4_entries: List of Pool4Entry objects (optional)
             dry_run: If True, only show what would be done without making changes
         """
         self.instance_name = instance_name
         self.pool6 = pool6
-        self.pool4 = pool4
-        self.pool4_protocols = pool4_protocols or ['tcp', 'udp']
-        self.pool4_port_range = pool4_port_range
+        self.pool4_entries = pool4_entries or []
         self.dry_run = dry_run
         self.logger = logging.getLogger(__name__)
 
@@ -580,6 +595,10 @@ class JoolNAT64Manager:
         """Create the Jool NAT64 instance if it doesn't exist"""
         if self.instance_exists():
             self.logger.info(f"jool instance '{self.instance_name}' already exists")
+            # Sync pool4 entries even if instance exists
+            if self.pool4_entries:
+                added, removed, unchanged = self.sync_pool4(self.pool4_entries)
+                self.logger.info(f"Pool4 sync: {added} added, {removed} removed, {unchanged} unchanged")
             return
 
         self.logger.info(f"Creating jool NAT64 instance '{self.instance_name}'")
@@ -597,33 +616,31 @@ class JoolNAT64Manager:
             ])
             self.logger.info(f"jool NAT64 instance '{self.instance_name}' configured with pool6: {pool6_clean}")
 
-            # Add pool4 if specified
-            if self.pool4:
-                self.add_pool4(self.pool4, self.pool4_protocols, self.pool4_port_range)
+            # Sync pool4 entries if specified
+            if self.pool4_entries:
+                added, removed, unchanged = self.sync_pool4(self.pool4_entries)
+                self.logger.info(f"Pool4 sync: {added} added, {removed} removed, {unchanged} unchanged")
 
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Failed to create NAT64 instance: {e}")
             raise
 
-    def add_pool4(self, pool4: str, protocols: Optional[List[str]] = None, port_range: str = "1-65535"):
+    def add_pool4_entry(self, entry: Pool4Entry) -> bool:
         """
-        Add IPv4 pool to the NAT64 instance
+        Add a pool4 entry to the NAT64 instance
 
         Args:
-            pool4: IPv4 pool specification (e.g., "192.0.2.1-192.0.2.10" or "192.0.2.0/24")
-            protocols: List of protocols to configure (default: ['tcp', 'udp'])
-            port_range: Port range for TCP/UDP (default: "1-65535")
+            entry: Pool4Entry to add
+
+        Returns:
+            True if all protocols added successfully, False otherwise
         """
-        pool4_clean = pool4.strip().strip("'").strip('"')
+        address_clean = entry.address.strip().strip("'").strip('"')
+        self.logger.info(f"Adding pool4 entry: {entry}")
 
-        # Default protocols if not specified
-        if protocols is None:
-            protocols = ['tcp', 'udp']
-
-        self.logger.info(f"Adding pool4: {pool4_clean} for protocols: {', '.join(protocols)}")
-
+        success = True
         # Add pool4 for each protocol
-        for protocol in protocols:
+        for protocol in entry.protocols:
             try:
                 cmd = [
                     "jool", "-i", self.instance_name,
@@ -632,30 +649,31 @@ class JoolNAT64Manager:
 
                 # Add protocol flag
                 if protocol.lower() == 'tcp':
-                    cmd.append("--tcp")
-                    cmd.append(pool4_clean)
-                    cmd.append(port_range)
+                    cmd.extend(["--tcp", address_clean, entry.port_range])
                 elif protocol.lower() == 'udp':
-                    cmd.append("--udp")
-                    cmd.append(pool4_clean)
-                    cmd.append(port_range)
+                    cmd.extend(["--udp", address_clean, entry.port_range])
+                elif protocol.lower() == 'icmp':
+                    cmd.extend(["--icmp", address_clean])
                 else:
                     self.logger.warning(f"Unknown protocol: {protocol}, skipping")
                     continue
 
                 self.run_command(cmd)
-                self.logger.info(f"Successfully added pool4 for {protocol.upper()}: {pool4_clean}")
+                self.logger.debug(f"Successfully added pool4 for {protocol.upper()}: {address_clean}")
 
             except subprocess.CalledProcessError as e:
-                self.logger.error(f"Failed to add pool4 for {protocol.upper()} {pool4_clean}: {e}")
-                raise
+                self.logger.error(f"Failed to add pool4 for {protocol.upper()} {address_clean}: {e}")
+                success = False
 
-    def get_pool4_entries(self) -> Set[str]:
+        return success
+
+    def get_pool4_entries(self) -> Dict[str, List[Dict[str, str]]]:
         """
         Retrieve current pool4 entries from Jool NAT64
 
         Returns:
-            Set of current pool4 entries
+            Dict mapping addresses to list of protocol/port entries
+            Example: {"192.0.2.1": [{"protocol": "tcp", "ports": "1-65535"}, ...]}
         """
         self.logger.info("Retrieving current pool4 entries from Jool NAT64")
 
@@ -666,54 +684,163 @@ class JoolNAT64Manager:
             )
         except subprocess.CalledProcessError:
             self.logger.warning("Could not retrieve pool4 entries, assuming empty")
-            return set()
+            return {}
 
-        entries = set()
+        entries = {}
         lines = result.stdout.strip().split('\n')
 
-        # Parse output
+        # Parse output - format is typically:
+        # Protocol  Address          Ports
+        # TCP       192.0.2.1        1-65535
+        # UDP       192.0.2.1        1-65535
         for line in lines:
             line = line.strip()
 
             # Skip empty lines, headers, and separators
             if not line or line.startswith('-') or line.startswith('='):
                 continue
-            if 'Mark' in line or 'Protocol' in line or 'Address' in line:
+            if 'Protocol' in line or 'Address' in line or 'Ports' in line or 'Mark' in line:
                 continue
 
-            # Try to extract pool4 entries
-            # Format varies, but usually contains IP addresses or ranges
+            # Parse line
             parts = line.split()
-            for part in parts:
-                # Look for IP addresses or CIDR notation
-                if '.' in part and ('/' in part or '-' in part or part.replace('.', '').replace('-', '').isdigit()):
-                    entries.add(part.strip())
-                    self.logger.debug(f"Found pool4 entry: {part}")
+            if len(parts) >= 2:
+                protocol = parts[0].lower()
+                address = parts[1]
+                ports = parts[2] if len(parts) >= 3 else ""
 
-        self.logger.info(f"Found {len(entries)} pool4 entries")
+                # Skip non-TCP/UDP/ICMP protocols
+                if protocol not in ['tcp', 'udp', 'icmp']:
+                    continue
+
+                if address not in entries:
+                    entries[address] = []
+
+                entries[address].append({
+                    "protocol": protocol,
+                    "ports": ports
+                })
+                self.logger.debug(f"Found pool4 entry: {protocol.upper()} {address} {ports}")
+
+        self.logger.info(f"Found {len(entries)} pool4 addresses with {sum(len(v) for v in entries.values())} total entries")
         return entries
 
-    def remove_pool4(self, pool4: str):
+    def remove_pool4_entry(self, address: str, protocol: str) -> bool:
         """
-        Remove IPv4 pool from the NAT64 instance
+        Remove a specific pool4 entry from the NAT64 instance
 
         Args:
-            pool4: IPv4 pool specification to remove
+            address: IPv4 address to remove
+            protocol: Protocol to remove (tcp, udp, icmp)
+
+        Returns:
+            True if successful, False otherwise
         """
-        self.logger.info(f"Removing pool4: {pool4}")
+        self.logger.info(f"Removing pool4 entry: {protocol.upper()} {address}")
 
         try:
-            self.run_command([
-                "jool", "-i", self.instance_name,
-                "pool4", "remove",
-                pool4
-            ])
-            self.logger.info(f"Successfully removed pool4: {pool4}")
+            cmd = ["jool", "-i", self.instance_name, "pool4", "remove"]
+
+            if protocol.lower() == 'tcp':
+                cmd.extend(["--tcp", address])
+            elif protocol.lower() == 'udp':
+                cmd.extend(["--udp", address])
+            elif protocol.lower() == 'icmp':
+                cmd.extend(["--icmp", address])
+            else:
+                self.logger.warning(f"Unknown protocol: {protocol}")
+                return False
+
+            self.run_command(cmd)
+            self.logger.debug(f"Successfully removed pool4 entry: {protocol.upper()} {address}")
+            return True
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to remove pool4 {pool4}: {e}")
-            # Don't raise - pool4 might already be gone
+            self.logger.error(f"Failed to remove pool4 {protocol.upper()} {address}: {e}")
             return False
-        return True
+
+    def sync_pool4(self, desired_entries: List[Pool4Entry]) -> Tuple[int, int, int]:
+        """
+        Synchronize pool4 entries with desired state (idempotent)
+
+        Args:
+            desired_entries: List of desired Pool4Entry objects
+
+        Returns:
+            Tuple of (added_count, removed_count, unchanged_count)
+        """
+        self.logger.info("Synchronizing pool4 entries")
+
+        # Get current entries
+        current_entries_dict = self.get_pool4_entries()
+
+        # Build desired state map
+        desired_map = {}
+        for entry in desired_entries:
+            addr = entry.address.strip().strip("'").strip('"')
+            if addr not in desired_map:
+                desired_map[addr] = []
+            for proto in entry.protocols:
+                desired_map[addr].append({
+                    "protocol": proto.lower(),
+                    "ports": entry.port_range
+                })
+
+        self.logger.debug(f"Current pool4 state: {current_entries_dict}")
+        self.logger.debug(f"Desired pool4 state: {desired_map}")
+
+        added_count = 0
+        removed_count = 0
+        unchanged_count = 0
+
+        # Remove entries that shouldn't exist
+        for addr, current_protos in current_entries_dict.items():
+            desired_protos = desired_map.get(addr, [])
+
+            for current_proto_entry in current_protos:
+                current_proto = current_proto_entry["protocol"]
+                current_ports = current_proto_entry["ports"]
+
+                # Check if this protocol/port combo should exist
+                should_exist = False
+                for desired_proto_entry in desired_protos:
+                    if (desired_proto_entry["protocol"] == current_proto and
+                        desired_proto_entry["ports"] == current_ports):
+                        should_exist = True
+                        break
+
+                if not should_exist:
+                    if self.remove_pool4_entry(addr, current_proto):
+                        removed_count += 1
+
+        # Add missing entries
+        for addr, desired_protos in desired_map.items():
+            current_protos = current_entries_dict.get(addr, [])
+
+            for desired_proto_entry in desired_protos:
+                desired_proto = desired_proto_entry["protocol"]
+                desired_ports = desired_proto_entry["ports"]
+
+                # Check if this protocol/port combo already exists
+                already_exists = False
+                for current_proto_entry in current_protos:
+                    if (current_proto_entry["protocol"] == desired_proto and
+                        current_proto_entry["ports"] == desired_ports):
+                        already_exists = True
+                        unchanged_count += 1
+                        break
+
+                if not already_exists:
+                    # Create a Pool4Entry for just this protocol
+                    entry = Pool4Entry(
+                        address=addr,
+                        protocols=[desired_proto],
+                        port_range=desired_ports
+                    )
+                    if self.add_pool4_entry(entry):
+                        added_count += 1
+
+        self.logger.info(f"Pool4 sync complete: {added_count} added, {removed_count} removed, {unchanged_count} unchanged")
+        return added_count, removed_count, unchanged_count
 
     def flush_pool4(self):
         """Flush all pool4 entries"""
@@ -728,15 +855,16 @@ class JoolNAT64Manager:
         except subprocess.CalledProcessError as e:
             self.logger.warning(f"Failed to flush pool4: {e}")
             # Try to remove entries individually
-            entries = self.get_pool4_entries()
-            for entry in entries:
-                self.remove_pool4(entry)
+            entries_dict = self.get_pool4_entries()
+            for addr, protos in entries_dict.items():
+                for proto_entry in protos:
+                    self.remove_pool4_entry(addr, proto_entry["protocol"])
 
     def setup(self):
         """
         Complete setup process
         """
-        # Create NAT64 instance
+        # Create NAT64 instance (and sync pool4)
         self.create_instance()
 
 
@@ -748,6 +876,51 @@ def setup_logging(verbose: bool = False):
         format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+
+
+def parse_pool4_entries(
+    pool4_list: List[str],
+    protocols: Optional[List[str]] = None,
+    port_range: str = "1-65535"
+) -> List[Pool4Entry]:
+    """
+    Parse pool4 command-line arguments into Pool4Entry objects
+
+    Args:
+        pool4_list: List of pool4 addresses
+        protocols: Default protocols to use (default: ['tcp', 'udp'])
+        port_range: Default port range (default: "1-65535")
+
+    Returns:
+        List of Pool4Entry objects
+    """
+    if not protocols:
+        protocols = ['tcp', 'udp']
+
+    entries = []
+    for pool4_str in pool4_list:
+        # Support format: "address" or "address:proto1,proto2" or "address:proto1,proto2:ports"
+        parts = pool4_str.split(':')
+        address = parts[0].strip().strip("'").strip('"')
+
+        entry_protocols = protocols
+        entry_port_range = port_range
+
+        if len(parts) >= 2:
+            # Protocols specified
+            entry_protocols = [p.strip().lower() for p in parts[1].split(',')]
+
+        if len(parts) >= 3:
+            # Port range specified
+            entry_port_range = parts[2].strip()
+
+        entries.append(Pool4Entry(
+            address=address,
+            protocols=entry_protocols,
+            port_range=entry_port_range
+        ))
+
+    return entries
 
 
 def main():
@@ -763,7 +936,7 @@ Environment Variables:
   JOOL_INSTANCE_SIIT     SIIT instance name (default: defaultnat46)
   JOOL_INSTANCE_NAT64    NAT64 instance name (default: defaultnat64)
   JOOL_POOL6             IPv6 pool (default: 64:ff9b::/96 for NAT64, optional for SIIT)
-  JOOL_POOL4             IPv4 pool for NAT64 (optional, e.g., "192.0.2.0/24" or "192.0.2.1-192.0.2.10")
+  JOOL_POOL4             Comma-separated IPv4 pools for NAT64 (e.g., "192.0.2.0/24,203.0.113.1")
   JOOL_POOL4_PROTOCOLS   Comma-separated protocols (default: tcp,udp)
   JOOL_POOL4_PORT_RANGE  Port range for TCP/UDP (default: 1-65535)
   EAM_CONFIG_FILE        Path to EAM config YAML file (only for SIIT mode)
@@ -779,21 +952,27 @@ Examples:
   # SIIT mode: Without pool6 (EAM only)
   %(prog)s --mode siit --no-pool6 /etc/jool/eam_config.yaml
 
-  # NAT64 mode: Setup instance only (no EAM)
+  # NAT64 mode: Setup instance only (no pool4)
   %(prog)s --mode nat64
 
   # NAT64 mode: Custom instance name and pool6
   %(prog)s --mode nat64 --instance my-nat64 --pool6 2001:db8:64::/96
   %(prog)s --mode nat64 --nat64-instance my-nat64 --pool6 2001:db8:64::/96
 
-  # NAT64 mode: With pool4
+  # NAT64 mode: With single pool4
   %(prog)s --mode nat64 --pool4 "192.0.2.0/24"
 
-  # NAT64 mode: Pool4 with specific protocols
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24" --pool4-protocols tcp udp
+  # NAT64 mode: With multiple pool4 entries
+  %(prog)s --mode nat64 --pool4 "192.0.2.0/24" --pool4 "203.0.113.1"
 
-  # NAT64 mode: Pool4 with custom port range
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24" --pool4-port-range "49152-65535"
+  # NAT64 mode: Pool4 with specific protocols per entry
+  %(prog)s --mode nat64 --pool4 "192.0.2.0/24:tcp,udp" --pool4 "203.0.113.1:tcp"
+
+  # NAT64 mode: Pool4 with custom port ranges
+  %(prog)s --mode nat64 --pool4 "192.0.2.0/24:tcp,udp:49152-65535"
+
+  # NAT64 mode: From environment variable (comma-separated)
+  JOOL_POOL4="192.0.2.0/24,203.0.113.1" %(prog)s --mode nat64
 
   # Dry run to see what would change
   %(prog)s --dry-run --mode siit /etc/jool/eam_config.yaml
@@ -827,18 +1006,19 @@ Examples:
     )
     parser.add_argument(
         '--pool4',
-        help='IPv4 pool for NAT64 (e.g., "192.0.2.0/24" or "192.0.2.1-192.0.2.10", default: from JOOL_POOL4)'
+        action='append',
+        help='IPv4 pool for NAT64 (can be specified multiple times). Format: "address" or "address:protocols" or "address:protocols:ports"'
     )
     parser.add_argument(
         '--pool4-protocols',
         nargs='+',
-        choices=['tcp', 'udp'],
-        help='Protocols for pool4 (default: tcp udp)'
+        choices=['tcp', 'udp', 'icmp'],
+        help='Default protocols for pool4 entries (default: tcp udp)'
     )
     parser.add_argument(
         '--pool4-port-range',
         default='1-65535',
-        help='Port range for pool4 TCP/UDP (default: 1-65535)'
+        help='Default port range for pool4 TCP/UDP (default: 1-65535)'
     )
     parser.add_argument(
         '--no-pool6',
@@ -877,7 +1057,7 @@ Examples:
             instance_name = os.environ.get('JOOL_INSTANCE_SIIT', 'defaultnat46')
 
         default_pool6 = os.environ.get('JOOL_POOL6')  # Optional for SIIT
-        pool4 = None  # SIIT doesn't use pool4
+        pool4_entries = []  # SIIT doesn't use pool4
     else:  # nat64
         config_path = None  # NAT64 doesn't use EAM config
 
@@ -891,10 +1071,13 @@ Examples:
 
         default_pool6 = os.environ.get('JOOL_POOL6', '64:ff9b::/96')  # Required for NAT64
 
-        # Pool4 for NAT64
-        pool4 = args.pool4 or os.environ.get('JOOL_POOL4')
-        if pool4:
-            pool4 = pool4.strip().strip("'").strip('"')
+        # Pool4 for NAT64 - support multiple entries
+        pool4_list = args.pool4 or []
+
+        # Also check environment variable (comma-separated)
+        env_pool4 = os.environ.get('JOOL_POOL4')
+        if env_pool4 and not pool4_list:
+            pool4_list = [p.strip() for p in env_pool4.split(',') if p.strip()]
 
         # Pool4 protocols (default: tcp, udp)
         pool4_protocols = args.pool4_protocols
@@ -908,6 +1091,9 @@ Examples:
 
         # Pool4 port range
         pool4_port_range = args.pool4_port_range or os.environ.get('JOOL_POOL4_PORT_RANGE', '1-65535')
+
+        # Parse pool4 entries
+        pool4_entries = parse_pool4_entries(pool4_list, pool4_protocols, pool4_port_range)
 
     # Handle pool6
     if args.no_pool6:
@@ -932,8 +1118,10 @@ Examples:
             logger.info(f"Pool6: {pool6}")
         else:
             logger.info("Pool6: None (EAM only)")
-        if mode == 'nat64' and pool4:
-            logger.info(f"Pool4: {pool4}")
+        if mode == 'nat64' and pool4_entries:
+            logger.info(f"Pool4 entries: {len(pool4_entries)}")
+            for entry in pool4_entries:
+                logger.info(f"  - {entry}")
         if config_path:
             logger.info(f"Config: {config_path}")
         if args.dry_run:
@@ -975,19 +1163,17 @@ Examples:
             manager = JoolNAT64Manager(
                 instance_name=instance_name,
                 pool6=pool6,
-                pool4=pool4,
-                pool4_protocols=pool4_protocols,
-                pool4_port_range=pool4_port_range,
+                pool4_entries=pool4_entries,
                 dry_run=args.dry_run
             )
 
-            # Setup instance
+            # Setup instance (includes pool4 sync)
             manager.setup()
 
             logger.info("=" * 60)
             logger.info("NAT64 instance setup complete!")
-            if pool4:
-                logger.info(f"Pool4 configured: {pool4}")
+            if pool4_entries:
+                logger.info(f"Pool4 entries configured: {len(pool4_entries)}")
             logger.info("=" * 60)
 
         if args.dry_run:
