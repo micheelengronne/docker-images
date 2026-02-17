@@ -679,7 +679,15 @@ class JoolNAT64Manager:
 
         try:
             result = self.run_command(
-                ["jool", "-i", self.instance_name, "pool4", "display"],
+                ["jool", "-i", self.instance_name, "pool4", "display", "--tcp"],
+                check=False
+            )
+            result += self.run_command(
+                ["jool", "-i", self.instance_name, "pool4", "display", "--udp"],
+                check=False
+            )
+            result += self.run_command(
+                ["jool", "-i", self.instance_name, "pool4", "display", "--icmp"],
                 check=False
             )
         except subprocess.CalledProcessError:
