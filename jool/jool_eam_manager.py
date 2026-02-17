@@ -689,15 +689,11 @@ class JoolNAT64Manager:
         entries = {}
         lines = result.stdout.strip().split('\n')
 
-        # Parse output - format is typically:
-        # Protocol  Address          Ports
-        # TCP       192.0.2.1        1-65535
-        # UDP       192.0.2.1        1-65535
         for line in lines:
             line = line.strip()
 
             # Skip empty lines, headers, and separators
-            if not line or line.startswith('-') or line.startswith('='):
+            if not line or line.startswith('-') or line.startswith('=') or line.startswith('+'):
                 continue
             if 'Protocol' in line or 'Address' in line or 'Ports' in line or 'Mark' in line:
                 continue
@@ -705,9 +701,9 @@ class JoolNAT64Manager:
             # Parse line
             parts = line.split()
             if len(parts) >= 2:
-                protocol = parts[0].lower()
-                address = parts[1]
-                ports = parts[2] if len(parts) >= 3 else ""
+                protocol = parts[1].lower()
+                address = parts[3]
+                ports = parts[4] if len(parts) >= 4 else ""
 
                 # Skip non-TCP/UDP/ICMP protocols
                 if protocol not in ['tcp', 'udp', 'icmp']:
