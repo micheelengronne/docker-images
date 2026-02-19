@@ -678,15 +678,15 @@ class JoolNAT64Manager:
         self.logger.info("Retrieving current pool4 entries from Jool NAT64")
 
         try:
-            result = self.run_command(
+            resulttcp = self.run_command(
                 ["jool", "-i", self.instance_name, "pool4", "display", "--tcp"],
                 check=False
             )
-            result += self.run_command(
+            resultudp = self.run_command(
                 ["jool", "-i", self.instance_name, "pool4", "display", "--udp"],
                 check=False
             )
-            result += self.run_command(
+            resulticmp = self.run_command(
                 ["jool", "-i", self.instance_name, "pool4", "display", "--icmp"],
                 check=False
             )
@@ -695,7 +695,7 @@ class JoolNAT64Manager:
             return {}
 
         entries = {}
-        lines = result.stdout.strip().split('\n')
+        lines = resulttcp.stdout.strip().split('\n') + resultudp.stdout.strip().split('\n') + resulticmp.stdout.strip().split('\n')
 
         for line in lines:
             line = line.strip()
