@@ -5,12 +5,15 @@ Jool SIIT/NAT64 EAM (Explicit Address Mapping) Manager
 This script manages Jool SIIT and NAT64 instances and IPv4-IPv6 EAM mappings in an idempotent manner.
 
 Features:
+- Sets up kernel modules (jool, jool_siit)
 - Creates Jool SIIT or NAT64 instance if not exists
 - Manages EAM mappings from YAML configuration (SIIT mode only)
 - Idempotent: removes mappings not in config, adds missing ones
 - Supports both SIIT and NAT64 modes
 - Optional pool6 for SIIT (can work with EAM only)
-- Supports multiple pool4 entries with idempotent sync (NAT64)
+- Multiple IPv4 pool4 addresses for NAT64 (--pool4 repeated on CLI or comma-separated env var)
+- Idempotent pool4 sync: per-protocol entries are added/removed to match desired state
+- ICMP ID range support for NAT64 pool4 (via --icmp flag)
 """
 
 import subprocess
@@ -23,6 +26,10 @@ from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 
 def ipv4_to_ipv6_embedded(ipv4_addr: str, ipv6_prefix: str) -> str:
     """
@@ -131,9 +138,53 @@ def parse_eam_mapping(ipv4: str, ipv6: str, auto_convert: bool = False) -> Tuple
     return ipv4_clean, ipv6_clean
 
 
+def validate_icmp_id_range(icmp_id_range: str) -> None:
+    """
+    Validate an ICMP ID range string.
+
+    ICMP Identifiers are 16-bit unsigned integers (0-65535).  They serve the
+    same session-tracking role for ICMP Echo that port numbers do for TCP/UDP,
+    and Jool exposes them through the ``--icmp`` flag on ``pool4 add/remove``.
+
+    Args:
+        icmp_id_range: Range string such as "0-65535", "1024-2047", or a
+                       single ID like "100".
+
+    Raises:
+        ValueError: if the format is invalid or values are out of [0, 65535].
+    """
+    parts = icmp_id_range.split('-')
+    try:
+        if len(parts) == 1:
+            val = int(parts[0])
+            if not (0 <= val <= 65535):
+                raise ValueError(f"ICMP ID {val} is out of range [0, 65535]")
+        elif len(parts) == 2:
+            low, high = int(parts[0]), int(parts[1])
+            if not (0 <= low <= 65535 and 0 <= high <= 65535):
+                raise ValueError(
+                    f"ICMP ID range '{icmp_id_range}' values must each be in [0, 65535]"
+                )
+            if low > high:
+                raise ValueError(f"ICMP ID range start {low} must be <= end {high}")
+        else:
+            raise ValueError(
+                f"Invalid ICMP ID range format '{icmp_id_range}' "
+                f"(expected 'low-high' or a single integer)"
+            )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Cannot parse ICMP ID range '{icmp_id_range}': {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclass
 class EAMMapping:
-    """Represents an EAM mapping between IPv4 and IPv6 addresses"""
+    """Represents an EAM mapping between IPv4 and IPv6 addresses."""
     ipv4: str
     ipv6: str
 
@@ -151,27 +202,44 @@ class EAMMapping:
 
 @dataclass
 class Pool4Entry:
-    """Represents a pool4 entry with address, protocols, and port range"""
-    address: str
-    protocols: List[str]
-    port_range: str = "1-65535"
+    """
+    Represents one atomic pool4 entry: a single protocol × IPv4 address × ID range.
+
+    For TCP and UDP the ``id_range`` is a port range (e.g. "1-65535").
+    For ICMP the ``id_range`` is an ICMP Identifier range (e.g. "0-65535").
+    Jool accepts the same positional ``<range>`` argument for both; the
+    semantics differ only in what the numbers represent.
+    """
+    protocol: str   # "tcp", "udp", or "icmp" – always stored lower-case
+    address: str    # IPv4 address, CIDR, or dash-range (e.g. "192.0.2.0/24")
+    id_range: str   # port range (tcp/udp) or ICMP ID range (icmp)
+
+    def __post_init__(self):
+        self.protocol = self.protocol.lower()
 
     def __hash__(self):
-        return hash((self.address, tuple(sorted(self.protocols)), self.port_range))
+        return hash((self.protocol, self.address, self.id_range))
 
     def __eq__(self, other):
         if not isinstance(other, Pool4Entry):
             return False
-        return (self.address == other.address and
-                set(self.protocols) == set(other.protocols) and
-                self.port_range == other.port_range)
+        return (
+            self.protocol == other.protocol
+            and self.address == other.address
+            and self.id_range == other.id_range
+        )
 
     def __str__(self):
-        return f"{self.address} ({', '.join(self.protocols)}) ports {self.port_range}"
+        label = "IDs" if self.protocol == "icmp" else "ports"
+        return f"{self.protocol.upper()} {self.address} ({label} {self.id_range})"
 
+
+# ---------------------------------------------------------------------------
+# SIIT manager
+# ---------------------------------------------------------------------------
 
 class JoolSIITManager:
-    """Manages Jool SIIT instances and EAM mappings"""
+    """Manages Jool SIIT instances and EAM mappings."""
 
     def __init__(
         self,
@@ -180,12 +248,12 @@ class JoolSIITManager:
         dry_run: bool = False
     ):
         """
-        Initialize the SIIT manager
+        Initialize the SIIT manager.
 
         Args:
-            instance_name: Name of the Jool SIIT instance
-            pool6: IPv6 pool for the instance (optional for SIIT)
-            dry_run: If True, only show what would be done without making changes
+            instance_name: Name of the Jool SIIT instance.
+            pool6: IPv6 pool for the instance (optional for SIIT).
+            dry_run: If True, only show what would be done without making changes.
         """
         self.instance_name = instance_name
         self.pool6 = pool6
@@ -199,15 +267,15 @@ class JoolSIITManager:
         shell: bool = False
     ) -> subprocess.CompletedProcess:
         """
-        Execute a shell command
+        Execute a shell command.
 
         Args:
-            cmd: Command to execute
-            check: Whether to raise exception on non-zero exit code
-            shell: Whether to use shell execution
+            cmd: Command to execute.
+            check: Whether to raise exception on non-zero exit code.
+            shell: Whether to use shell execution.
 
         Returns:
-            CompletedProcess result
+            CompletedProcess result.
         """
         cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
         self.logger.debug(f"Executing: {cmd_str}")
@@ -237,12 +305,7 @@ class JoolSIITManager:
             raise
 
     def instance_exists(self) -> bool:
-        """
-        Check if the Jool SIIT instance exists
-
-        Returns:
-            True if instance exists, False otherwise
-        """
+        """Check if the Jool SIIT instance exists."""
         try:
             result = self.run_command(
                 ["jool_siit", "instance", "display"],
@@ -253,7 +316,7 @@ class JoolSIITManager:
             return False
 
     def create_instance(self):
-        """Create the Jool SIIT instance if it doesn't exist"""
+        """Create the Jool SIIT instance if it doesn't exist."""
         if self.instance_exists():
             self.logger.info(f"jool_siit instance '{self.instance_name}' already exists")
             return
@@ -267,9 +330,7 @@ class JoolSIITManager:
                 "--netfilter"
             ]
 
-            # Add pool6 only if specified
             if self.pool6:
-                # Strip any surrounding quotes
                 pool6_clean = self.pool6.strip().strip("'").strip('"')
                 cmd.extend(["--pool6", pool6_clean])
                 self.logger.info(f"Using pool6: {pool6_clean}")
@@ -285,10 +346,10 @@ class JoolSIITManager:
 
     def get_current_mappings(self) -> Set[EAMMapping]:
         """
-        Retrieve current EAM mappings from Jool SIIT
+        Retrieve current EAM mappings from Jool SIIT.
 
         Returns:
-            Set of current EAM mappings
+            Set of current EAM mappings.
         """
         self.logger.info("Retrieving current EAM mappings from Jool SIIT")
 
@@ -304,7 +365,6 @@ class JoolSIITManager:
         mappings = set()
         lines = result.stdout.strip().split('\n')
 
-        # Parse output - Jool EAM display format varies, handle multiple formats
         for line in lines:
             line = line.strip()
 
@@ -314,7 +374,6 @@ class JoolSIITManager:
             if 'IPv4' in line or 'IPv6' in line:
                 continue
 
-            # Try to parse mapping line
             # Format can be: "ipv4_addr | ipv6_addr" or "ipv4_addr    ipv6_addr"
             if '|' in line:
                 parts = [p.strip() for p in line.split('|')]
@@ -325,7 +384,6 @@ class JoolSIITManager:
                 ipv6 = parts[1].strip()
                 ipv4 = parts[2].strip()
 
-                # Validate addresses have content and look valid
                 if ipv4 and ipv6 and '.' in ipv4 and ':' in ipv6:
                     mappings.add(EAMMapping(ipv4, ipv6))
                     self.logger.info(f"Found mapping: {ipv4} <-> {ipv6}")
@@ -334,17 +392,8 @@ class JoolSIITManager:
         return mappings
 
     def add_mapping(self, mapping: EAMMapping) -> bool:
-        """
-        Add an EAM mapping to Jool SIIT
-
-        Args:
-            mapping: The mapping to add
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Add an EAM mapping to Jool SIIT."""
         self.logger.info(f"Adding mapping: {mapping}")
-
         try:
             self.run_command([
                 "jool_siit", "-i", self.instance_name,
@@ -358,17 +407,8 @@ class JoolSIITManager:
             return False
 
     def remove_mapping(self, mapping: EAMMapping) -> bool:
-        """
-        Remove an EAM mapping from Jool SIIT
-
-        Args:
-            mapping: The mapping to remove
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Remove an EAM mapping from Jool SIIT."""
         self.logger.info(f"Removing mapping: {mapping}")
-
         try:
             self.run_command([
                 "jool_siit", "-i", self.instance_name,
@@ -383,14 +423,14 @@ class JoolSIITManager:
 
     def load_config(self, config_path: str, auto_convert: bool = True) -> Set[EAMMapping]:
         """
-        Load desired mappings from YAML config file
+        Load desired EAM mappings from YAML config file.
 
         Args:
-            config_path: Path to YAML config file
-            auto_convert: Enable automatic IPv6 address generation from IPv4
+            config_path: Path to YAML config file.
+            auto_convert: Enable automatic IPv6 address generation from IPv4.
 
         Returns:
-            Set of desired EAM mappings
+            Set of desired EAM mappings.
         """
         self.logger.info(f"Loading configuration from {config_path}")
 
@@ -406,14 +446,11 @@ class JoolSIITManager:
             return set()
 
         mappings = set()
-
-        # Support multiple config formats
         mapping_list = None
         default_prefix = None
 
         if 'eam_mappings' in config:
             mapping_list = config['eam_mappings']
-            # Check for global auto_convert_prefix
             default_prefix = config.get('auto_convert_prefix', '64:ff9b::/96')
         elif 'mappings' in config:
             mapping_list = config['mappings']
@@ -437,14 +474,11 @@ class JoolSIITManager:
                     self.logger.warning(f"Skipping invalid mapping: {item}")
                     continue
 
-                # Handle auto-conversion
                 try:
-                    # If ipv6 is "auto", use the default prefix
                     if ipv6.lower() == 'auto':
                         ipv6 = f"auto:{default_prefix}"
 
                     ipv4_final, ipv6_final = parse_eam_mapping(ipv4, ipv6, auto_convert=auto_convert)
-
                     mappings.add(EAMMapping(ipv4_final, ipv6_final))
 
                     if ipv6.startswith('auto'):
@@ -463,33 +497,32 @@ class JoolSIITManager:
 
     def sync_mappings(self, desired_mappings: Set[EAMMapping]) -> Tuple[int, int, int]:
         """
-        Synchronize Jool EAM with desired mappings (idempotent)
+        Synchronize Jool EAM with desired mappings (idempotent).
 
         Args:
-            desired_mappings: Set of desired mappings
+            desired_mappings: Set of desired mappings.
 
         Returns:
-            Tuple of (added_count, removed_count, unchanged_count)
+            Tuple of (added_count, removed_count, unchanged_count).
         """
         current_mappings = self.get_current_mappings()
 
         self.logger.debug(f"Current mappings {current_mappings}")
         self.logger.debug(f"Desired mappings {desired_mappings}")
 
-        # Calculate differences
         to_add = desired_mappings - current_mappings
         to_remove = current_mappings - desired_mappings
         unchanged = current_mappings & desired_mappings
 
-        self.logger.info(f"Sync plan: {len(to_add)} to add, {len(to_remove)} to remove, {len(unchanged)} unchanged")
+        self.logger.info(
+            f"Sync plan: {len(to_add)} to add, {len(to_remove)} to remove, {len(unchanged)} unchanged"
+        )
 
-        # Remove unwanted mappings first
         removed_count = 0
         for mapping in to_remove:
             if self.remove_mapping(mapping):
                 removed_count += 1
 
-        # Add new mappings
         added_count = 0
         for mapping in to_add:
             if self.add_mapping(mapping):
@@ -498,38 +531,74 @@ class JoolSIITManager:
         return added_count, removed_count, len(unchanged)
 
     def setup(self):
-        """
-        Complete setup process
-        """
-
-        # Create SIIT instance
+        """Complete setup: create SIIT instance if absent."""
         self.create_instance()
 
 
+# ---------------------------------------------------------------------------
+# NAT64 manager
+# ---------------------------------------------------------------------------
+
 class JoolNAT64Manager:
-    """Manages Jool NAT64 instances"""
+    """Manages Jool NAT64 instances, including multiple pool4 addresses."""
 
     def __init__(
         self,
         instance_name: str = "defaultnat64",
         pool6: str = "64:ff9b::/96",
-        pool4_entries: Optional[List[Pool4Entry]] = None,
+        pool4: Optional[List[str]] = None,
+        pool4_protocols: Optional[List[str]] = None,
+        pool4_port_range: str = "1-65535",
+        icmp_id_range: str = "0-65535",
         dry_run: bool = False
     ):
         """
-        Initialize the NAT64 manager
+        Initialize the NAT64 manager.
 
         Args:
-            instance_name: Name of the Jool NAT64 instance
-            pool6: IPv6 pool for the instance (required for NAT64)
-            pool4_entries: List of Pool4Entry objects (optional)
-            dry_run: If True, only show what would be done without making changes
+            instance_name: Name of the Jool NAT64 instance.
+            pool6: IPv6 pool for the instance (required for NAT64).
+            pool4: List of IPv4 pool addresses/prefixes.  Every address is
+                   applied to every protocol in ``pool4_protocols``.
+                   e.g. ["192.0.2.0/24", "198.51.100.0/24"]
+            pool4_protocols: Protocols to configure for every pool4 address.
+                             Accepted values: "tcp", "udp", "icmp".
+                             Defaults to ["tcp", "udp"].
+            pool4_port_range: Port range for TCP and UDP entries (default "1-65535").
+                              Ignored when the protocol is "icmp".
+            icmp_id_range: ICMP Identifier range for ICMP pool4 entries
+                           (default "0-65535").  ICMP Identifiers are 16-bit
+                           unsigned integers (0-65535) used by Jool to track
+                           ICMP Echo sessions instead of port numbers.  Jool
+                           exposes this via the ``--icmp`` flag on pool4
+                           add/remove.  Restricting the range (e.g. "1024-2047")
+                           avoids ID collisions when multiple NAT64 boxes share
+                           the same pool4 address.
+                           Ignored when "icmp" is not in ``pool4_protocols``.
+            dry_run: If True, only show what would be done without making changes.
         """
         self.instance_name = instance_name
         self.pool6 = pool6
-        self.pool4_entries = pool4_entries or []
+        # Normalise pool4 to a clean list
+        self.pool4: List[str] = []
+        if pool4:
+            for addr in pool4:
+                clean = addr.strip().strip("'").strip('"')
+                if clean:
+                    self.pool4.append(clean)
+        self.pool4_protocols: List[str] = [p.lower() for p in (pool4_protocols or ['tcp', 'udp'])]
+        self.pool4_port_range = pool4_port_range
+        self.icmp_id_range = icmp_id_range
         self.dry_run = dry_run
         self.logger = logging.getLogger(__name__)
+
+        # Validate ICMP ID range eagerly if ICMP is requested
+        if 'icmp' in self.pool4_protocols:
+            validate_icmp_id_range(self.icmp_id_range)
+
+    # ------------------------------------------------------------------
+    # Command execution
+    # ------------------------------------------------------------------
 
     def run_command(
         self,
@@ -538,15 +607,15 @@ class JoolNAT64Manager:
         shell: bool = False
     ) -> subprocess.CompletedProcess:
         """
-        Execute a shell command
+        Execute a shell command.
 
         Args:
-            cmd: Command to execute
-            check: Whether to raise exception on non-zero exit code
-            shell: Whether to use shell execution
+            cmd: Command to execute.
+            check: Whether to raise exception on non-zero exit code.
+            shell: Whether to use shell execution.
 
         Returns:
-            CompletedProcess result
+            CompletedProcess result.
         """
         cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
         self.logger.debug(f"Executing: {cmd_str}")
@@ -575,13 +644,12 @@ class JoolNAT64Manager:
             self.logger.error(f"STDERR: {e.stderr}")
             raise
 
-    def instance_exists(self) -> bool:
-        """
-        Check if the Jool NAT64 instance exists
+    # ------------------------------------------------------------------
+    # Instance management
+    # ------------------------------------------------------------------
 
-        Returns:
-            True if instance exists, False otherwise
-        """
+    def instance_exists(self) -> bool:
+        """Check if the Jool NAT64 instance exists."""
         try:
             result = self.run_command(
                 ["jool", "instance", "display"],
@@ -592,18 +660,13 @@ class JoolNAT64Manager:
             return False
 
     def create_instance(self):
-        """Create the Jool NAT64 instance if it doesn't exist"""
+        """Create the Jool NAT64 instance if it doesn't exist."""
         if self.instance_exists():
             self.logger.info(f"jool instance '{self.instance_name}' already exists")
-            # Sync pool4 entries even if instance exists
-            if self.pool4_entries:
-                added, removed, unchanged = self.sync_pool4(self.pool4_entries)
-                self.logger.info(f"Pool4 sync: {added} added, {removed} removed, {unchanged} unchanged")
             return
 
         self.logger.info(f"Creating jool NAT64 instance '{self.instance_name}'")
 
-        # Strip any surrounding quotes from pool6
         pool6_clean = self.pool6.strip().strip("'").strip('"')
         self.logger.debug(f"pool6 value: [{pool6_clean}] (type: {type(pool6_clean).__name__})")
 
@@ -614,66 +677,57 @@ class JoolNAT64Manager:
                 "--netfilter",
                 "--pool6", pool6_clean
             ])
-            self.logger.info(f"jool NAT64 instance '{self.instance_name}' configured with pool6: {pool6_clean}")
-
-            # Sync pool4 entries if specified
-            if self.pool4_entries:
-                added, removed, unchanged = self.sync_pool4(self.pool4_entries)
-                self.logger.info(f"Pool4 sync: {added} added, {removed} removed, {unchanged} unchanged")
-
+            self.logger.info(
+                f"jool NAT64 instance '{self.instance_name}' configured with pool6: {pool6_clean}"
+            )
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Failed to create NAT64 instance: {e}")
             raise
 
-    def add_pool4_entry(self, entry: Pool4Entry) -> bool:
-        """
-        Add a pool4 entry to the NAT64 instance
+    # ------------------------------------------------------------------
+    # Pool4: desired-state derivation
+    # ------------------------------------------------------------------
 
-        Args:
-            entry: Pool4Entry to add
+    def build_desired_pool4_entries(self) -> Set[Pool4Entry]:
+        """
+        Build the complete set of desired Pool4Entry objects from the current
+        configuration (self.pool4 × self.pool4_protocols).
+
+        Each address is combined with each protocol.  TCP/UDP entries use
+        ``self.pool4_port_range``; ICMP entries use ``self.icmp_id_range``.
 
         Returns:
-            True if all protocols added successfully, False otherwise
+            Set of Pool4Entry representing the desired pool4 state.
         """
-        address_clean = entry.address.strip().strip("'").strip('"')
-        self.logger.info(f"Adding pool4 entry: {entry}")
+        desired: Set[Pool4Entry] = set()
+        for address in self.pool4:
+            for protocol in self.pool4_protocols:
+                id_range = self.icmp_id_range if protocol == 'icmp' else self.pool4_port_range
+                desired.add(Pool4Entry(protocol=protocol, address=address, id_range=id_range))
+        return desired
 
-        success = True
-        # Add pool4 for each protocol
-        for protocol in entry.protocols:
-            try:
-                cmd = [
-                    "jool", "-i", self.instance_name,
-                    "pool4", "add"
-                ]
+    # ------------------------------------------------------------------
+    # Pool4: read current state
+    # ------------------------------------------------------------------
 
-                # Add protocol flag
-                if protocol.lower() == 'tcp':
-                    cmd.extend(["--tcp", address_clean, entry.port_range])
-                elif protocol.lower() == 'udp':
-                    cmd.extend(["--udp", address_clean, entry.port_range])
-                elif protocol.lower() == 'icmp':
-                    cmd.extend(["--icmp", address_clean])
-                else:
-                    self.logger.warning(f"Unknown protocol: {protocol}, skipping")
-                    continue
-
-                self.run_command(cmd)
-                self.logger.debug(f"Successfully added pool4 for {protocol.upper()}: {address_clean}")
-
-            except subprocess.CalledProcessError as e:
-                self.logger.error(f"Failed to add pool4 for {protocol.upper()} {address_clean}: {e}")
-                success = False
-
-        return success
-
-    def get_pool4_entries(self) -> Dict[str, List[Dict[str, str]]]:
+    def get_pool4_entries(self) -> Set[Pool4Entry]:
         """
-        Retrieve current pool4 entries from Jool NAT64
+        Retrieve current pool4 entries from the running Jool NAT64 instance.
+
+        Jool's ``pool4 display`` output looks like::
+
+            +------+----------+---------------+-------------+
+            | Mark | Protocol | Address       | Ports       |
+            +------+----------+---------------+-------------+
+            |    0 | TCP      | 192.0.2.0/24  | 1-65535     |
+            |    0 | UDP      | 192.0.2.0/24  | 1-65535     |
+            |    0 | ICMP     | 192.0.2.0/24  | 0-65535     |
+            +------+----------+---------------+-------------+
+
+        The "Ports" column header is also used for ICMP ID ranges.
 
         Returns:
-            Dict mapping addresses to list of protocol/port entries
-            Example: {"192.0.2.1": [{"protocol": "tcp", "ports": "1-65535"}, ...]}
+            Set of Pool4Entry representing the current pool4 state.
         """
         self.logger.info("Retrieving current pool4 entries from Jool NAT64")
 
@@ -692,164 +746,107 @@ class JoolNAT64Manager:
             )
         except subprocess.CalledProcessError:
             self.logger.warning("Could not retrieve pool4 entries, assuming empty")
-            return {}
+            return set()
 
-        entries = {}
+        entries: Set[Pool4Entry] = set()
         lines = resulttcp.stdout.strip().split('\n') + resultudp.stdout.strip().split('\n') + resulticmp.stdout.strip().split('\n')
 
         for line in lines:
             line = line.strip()
 
-            # Skip empty lines, headers, and separators
-            if not line or line.startswith('-') or line.startswith('=') or line.startswith('+'):
+            # Skip separators and header rows
+            if not line or line.startswith('+') or line.startswith('-') or line.startswith('='):
                 continue
-            if 'Protocol' in line or 'Address' in line or 'Ports' in line or 'Mark' in line:
+            if '|' not in line:
                 continue
 
-            # Parse line
-            parts = line.split()
-            if len(parts) >= 2:
-                protocol = parts[1].lower()
-                address = parts[3]
-                ports = parts[4] if len(parts) >= 4 else ""
+            parts = [p.strip() for p in line.split('|') if p.strip()]
+            # Expected columns: Mark | Protocol | Address | Ports/IDs
+            if len(parts) < 4:
+                continue
 
-                # Skip non-TCP/UDP/ICMP protocols
-                if protocol not in ['tcp', 'udp', 'icmp']:
-                    continue
+            protocol_raw = parts[1].lower()
+            address_raw = parts[3]
+            id_range_raw = parts[4]
 
-                if address not in entries:
-                    entries[address] = []
+            if protocol_raw not in ('tcp', 'udp', 'icmp'):
+                continue
+            if '.' not in address_raw:   # must look like an IPv4 address
+                continue
 
-                entries[address].append({
-                    "protocol": protocol,
-                    "ports": ports
-                })
-                self.logger.debug(f"Found pool4 entry: {protocol.upper()} {address} {ports}")
+            entry = Pool4Entry(protocol=protocol_raw, address=address_raw, id_range=id_range_raw)
+            entries.add(entry)
+            self.logger.debug(f"Found pool4 entry: {entry}")
 
-        self.logger.info(f"Found {len(entries)} pool4 addresses with {sum(len(v) for v in entries.values())} total entries")
+        self.logger.info(f"Found {len(entries)} pool4 entries")
         return entries
 
-    def remove_pool4_entry(self, address: str, protocol: str) -> bool:
+    # ------------------------------------------------------------------
+    # Pool4: add / remove individual entries
+    # ------------------------------------------------------------------
+
+    def add_pool4_entry(self, entry: Pool4Entry) -> bool:
         """
-        Remove a specific pool4 entry from the NAT64 instance
+        Add a single Pool4Entry to the NAT64 instance.
+
+        Jool command:
+            jool -i <instance> pool4 add --<protocol> <address> <id_range>
+
+        For ICMP, ``--icmp`` is used together with the ICMP ID range instead of
+        port numbers.
 
         Args:
-            address: IPv4 address to remove
-            protocol: Protocol to remove (tcp, udp, icmp)
+            entry: The pool4 entry to add.
 
         Returns:
-            True if successful, False otherwise
+            True if successful, False otherwise.
         """
-        self.logger.info(f"Removing pool4 entry: {protocol.upper()} {address}")
-
+        self.logger.info(f"Adding pool4 entry: {entry}")
         try:
-            cmd = ["jool", "-i", self.instance_name, "pool4", "remove"]
-
-            if protocol.lower() == 'tcp':
-                cmd.extend(["--tcp", address])
-            elif protocol.lower() == 'udp':
-                cmd.extend(["--udp", address])
-            elif protocol.lower() == 'icmp':
-                cmd.extend(["--icmp", address])
-            else:
-                self.logger.warning(f"Unknown protocol: {protocol}")
-                return False
-
-            self.run_command(cmd)
-            self.logger.debug(f"Successfully removed pool4 entry: {protocol.upper()} {address}")
+            self.run_command([
+                "jool", "-i", self.instance_name,
+                "pool4", "add",
+                f"--{entry.protocol}",
+                entry.address,
+                entry.id_range
+            ])
+            self.logger.info(f"Successfully added pool4 entry: {entry}")
             return True
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to remove pool4 {protocol.upper()} {address}: {e}")
+            self.logger.error(f"Failed to add pool4 entry {entry}: {e}")
             return False
 
-    def sync_pool4(self, desired_entries: List[Pool4Entry]) -> Tuple[int, int, int]:
+    def remove_pool4_entry(self, entry: Pool4Entry) -> bool:
         """
-        Synchronize pool4 entries with desired state (idempotent)
+        Remove a single Pool4Entry from the NAT64 instance.
+
+        Jool command:
+            jool -i <instance> pool4 remove --<protocol> <address> <id_range>
 
         Args:
-            desired_entries: List of desired Pool4Entry objects
+            entry: The pool4 entry to remove.
 
         Returns:
-            Tuple of (added_count, removed_count, unchanged_count)
+            True if successful, False otherwise.
         """
-        self.logger.info("Synchronizing pool4 entries")
-
-        # Get current entries
-        current_entries_dict = self.get_pool4_entries()
-
-        # Build desired state map
-        desired_map = {}
-        for entry in desired_entries:
-            addr = entry.address.strip().strip("'").strip('"')
-            if addr not in desired_map:
-                desired_map[addr] = []
-            for proto in entry.protocols:
-                desired_map[addr].append({
-                    "protocol": proto.lower(),
-                    "ports": entry.port_range
-                })
-
-        self.logger.debug(f"Current pool4 state: {current_entries_dict}")
-        self.logger.debug(f"Desired pool4 state: {desired_map}")
-
-        added_count = 0
-        removed_count = 0
-        unchanged_count = 0
-
-        # Remove entries that shouldn't exist
-        for addr, current_protos in current_entries_dict.items():
-            desired_protos = desired_map.get(addr, [])
-
-            for current_proto_entry in current_protos:
-                current_proto = current_proto_entry["protocol"]
-                current_ports = current_proto_entry["ports"]
-
-                # Check if this protocol/port combo should exist
-                should_exist = False
-                for desired_proto_entry in desired_protos:
-                    if (desired_proto_entry["protocol"] == current_proto and
-                        desired_proto_entry["ports"] == current_ports):
-                        should_exist = True
-                        break
-
-                if not should_exist:
-                    if self.remove_pool4_entry(addr, current_proto):
-                        removed_count += 1
-
-        # Add missing entries
-        for addr, desired_protos in desired_map.items():
-            current_protos = current_entries_dict.get(addr, [])
-
-            for desired_proto_entry in desired_protos:
-                desired_proto = desired_proto_entry["protocol"]
-                desired_ports = desired_proto_entry["ports"]
-
-                # Check if this protocol/port combo already exists
-                already_exists = False
-                for current_proto_entry in current_protos:
-                    if (current_proto_entry["protocol"] == desired_proto and
-                        current_proto_entry["ports"] == desired_ports):
-                        already_exists = True
-                        unchanged_count += 1
-                        break
-
-                if not already_exists:
-                    # Create a Pool4Entry for just this protocol
-                    entry = Pool4Entry(
-                        address=addr,
-                        protocols=[desired_proto],
-                        port_range=desired_ports
-                    )
-                    if self.add_pool4_entry(entry):
-                        added_count += 1
-
-        self.logger.info(f"Pool4 sync complete: {added_count} added, {removed_count} removed, {unchanged_count} unchanged")
-        return added_count, removed_count, unchanged_count
+        self.logger.info(f"Removing pool4 entry: {entry}")
+        try:
+            self.run_command([
+                "jool", "-i", self.instance_name,
+                "pool4", "remove",
+                f"--{entry.protocol}",
+                entry.address,
+                entry.id_range
+            ])
+            self.logger.info(f"Successfully removed pool4 entry: {entry}")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to remove pool4 entry {entry}: {e}")
+            return False
 
     def flush_pool4(self):
-        """Flush all pool4 entries"""
+        """Flush all pool4 entries (bulk removal fallback)."""
         self.logger.info("Flushing all pool4 entries")
-
         try:
             self.run_command([
                 "jool", "-i", self.instance_name,
@@ -858,22 +855,79 @@ class JoolNAT64Manager:
             self.logger.info("Successfully flushed pool4")
         except subprocess.CalledProcessError as e:
             self.logger.warning(f"Failed to flush pool4: {e}")
-            # Try to remove entries individually
-            entries_dict = self.get_pool4_entries()
-            for addr, protos in entries_dict.items():
-                for proto_entry in protos:
-                    self.remove_pool4_entry(addr, proto_entry["protocol"])
+            # Fall back to removing entries one by one
+            for entry in self.get_pool4_entries():
+                self.remove_pool4_entry(entry)
 
-    def setup(self):
+    # ------------------------------------------------------------------
+    # Pool4: idempotent sync
+    # ------------------------------------------------------------------
+
+    def sync_pool4(self, desired_entries: Set[Pool4Entry]) -> Tuple[int, int, int]:
         """
-        Complete setup process
+        Synchronize pool4 with the desired set of entries (idempotent).
+
+        Entries present in Jool but absent from ``desired_entries`` are removed.
+        Entries in ``desired_entries`` but absent from Jool are added.
+        Entries present in both are left untouched.
+
+        Args:
+            desired_entries: The complete desired pool4 state.
+
+        Returns:
+            Tuple of (added_count, removed_count, unchanged_count).
         """
-        # Create NAT64 instance (and sync pool4)
+        current_entries = self.get_pool4_entries()
+
+        self.logger.debug(f"Current pool4 entries: {current_entries}")
+        self.logger.debug(f"Desired pool4 entries: {desired_entries}")
+
+        to_add = desired_entries - current_entries
+        to_remove = current_entries - desired_entries
+        unchanged = current_entries & desired_entries
+
+        self.logger.info(
+            f"Pool4 sync plan: {len(to_add)} to add, "
+            f"{len(to_remove)} to remove, {len(unchanged)} unchanged"
+        )
+
+        removed_count = 0
+        for entry in to_remove:
+            if self.remove_pool4_entry(entry):
+                removed_count += 1
+
+        added_count = 0
+        for entry in to_add:
+            if self.add_pool4_entry(entry):
+                added_count += 1
+
+        return added_count, removed_count, len(unchanged)
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def setup(self) -> Tuple[int, int, int]:
+        """
+        Complete setup: create instance if absent, then sync pool4 idempotently.
+
+        Returns:
+            Tuple of (pool4_added, pool4_removed, pool4_unchanged).
+        """
         self.create_instance()
 
+        desired = self.build_desired_pool4_entries()
+        if desired:
+            return self.sync_pool4(desired)
+        return 0, 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Logging helper
+# ---------------------------------------------------------------------------
 
 def setup_logging(verbose: bool = False):
-    """Configure logging"""
+    """Configure logging."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -882,57 +936,16 @@ def setup_logging(verbose: bool = False):
     )
 
 
-def parse_pool4_entries(
-    pool4_list: List[str],
-    protocols: Optional[List[str]] = None,
-    port_range: str = "1-65535"
-) -> List[Pool4Entry]:
-    """
-    Parse pool4 command-line arguments into Pool4Entry objects
-
-    Args:
-        pool4_list: List of pool4 addresses
-        protocols: Default protocols to use (default: ['tcp', 'udp'])
-        port_range: Default port range (default: "1-65535")
-
-    Returns:
-        List of Pool4Entry objects
-    """
-    if not protocols:
-        protocols = ['tcp', 'udp']
-
-    entries = []
-    for pool4_str in pool4_list:
-        # Support format: "address" or "address:proto1,proto2" or "address:proto1,proto2:ports"
-        parts = pool4_str.split(':')
-        address = parts[0].strip().strip("'").strip('"')
-
-        entry_protocols = protocols
-        entry_port_range = port_range
-
-        if len(parts) >= 2:
-            # Protocols specified
-            entry_protocols = [p.strip().lower() for p in parts[1].split(',')]
-
-        if len(parts) >= 3:
-            # Port range specified
-            entry_port_range = parts[2].strip()
-
-        entries.append(Pool4Entry(
-            address=address,
-            protocols=entry_protocols,
-            port_range=entry_port_range
-        ))
-
-    return entries
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
-    """Main entry point"""
+    """Main entry point."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Manage Jool SIIT/NAT64 instance and EAM mappings from YAML config (idempotent)',
+        description='Manage Jool SIIT/NAT64 instance and EAM/pool4 mappings (idempotent)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment Variables:
@@ -940,10 +953,26 @@ Environment Variables:
   JOOL_INSTANCE_SIIT     SIIT instance name (default: defaultnat46)
   JOOL_INSTANCE_NAT64    NAT64 instance name (default: defaultnat64)
   JOOL_POOL6             IPv6 pool (default: 64:ff9b::/96 for NAT64, optional for SIIT)
-  JOOL_POOL4             Comma-separated IPv4 pools for NAT64 (e.g., "192.0.2.0/24,203.0.113.1")
-  JOOL_POOL4_PROTOCOLS   Comma-separated protocols (default: tcp,udp)
-  JOOL_POOL4_PORT_RANGE  Port range for TCP/UDP (default: 1-65535)
-  EAM_CONFIG_FILE        Path to EAM config YAML file (only for SIIT mode)
+  JOOL_POOL4             Comma-separated IPv4 pool addresses for NAT64
+                           e.g. "192.0.2.0/24,198.51.100.0/24"
+  JOOL_POOL4_PROTOCOLS   Comma-separated protocols (default: tcp,udp; also accepts icmp)
+  JOOL_POOL4_PORT_RANGE  Port range for TCP/UDP entries (default: 1-65535)
+  JOOL_ICMP_ID_RANGE     ICMP Identifier range for ICMP pool4 entries (default: 0-65535)
+  EAM_CONFIG_FILE        Path to EAM config YAML file (SIIT mode only)
+
+ICMP ID range:
+  ICMP does not use port numbers; Jool tracks NAT64 sessions using the 16-bit
+  ICMP Identifier field present in Echo Request/Reply (ping) messages.
+  Including 'icmp' in --pool4-protocols creates a pool4 entry with --icmp and
+  the configured ID range.  Restricting the range (e.g. "1024-2047") avoids
+  Identifier collisions when multiple NAT64 appliances share the same pool4
+  address.
+
+Pool4 idempotency:
+  On every run the script reads the live pool4 state from Jool, computes the
+  delta against the desired state (address × protocol cartesian product), then
+  adds missing entries and removes unexpected ones.  No entry is touched if it
+  already matches the desired configuration.
 
 Examples:
   # SIIT mode: Setup instance and sync EAM mappings
@@ -959,27 +988,26 @@ Examples:
   # NAT64 mode: Setup instance only (no pool4)
   %(prog)s --mode nat64
 
-  # NAT64 mode: Custom instance name and pool6
-  %(prog)s --mode nat64 --instance my-nat64 --pool6 2001:db8:64::/96
-  %(prog)s --mode nat64 --nat64-instance my-nat64 --pool6 2001:db8:64::/96
+  # NAT64 mode: Single pool4 address, TCP + UDP (classic)
+  %(prog)s --mode nat64 --pool4 192.0.2.0/24
 
-  # NAT64 mode: With single pool4
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24"
+  # NAT64 mode: Multiple pool4 addresses
+  %(prog)s --mode nat64 --pool4 192.0.2.0/24 --pool4 198.51.100.0/24
 
-  # NAT64 mode: With multiple pool4 entries
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24" --pool4 "203.0.113.1"
+  # NAT64 mode: Full protocol suite including ICMP
+  %(prog)s --mode nat64 --pool4 192.0.2.0/24 --pool4-protocols tcp udp icmp
 
-  # NAT64 mode: Pool4 with specific protocols per entry
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24:tcp,udp" --pool4 "203.0.113.1:tcp"
+  # NAT64 mode: Restricted ICMP ID range (shared pool4 address scenario)
+  %(prog)s --mode nat64 --pool4 192.0.2.0/24 --pool4-protocols tcp udp icmp \\
+           --icmp-id-range 1024-2047
 
-  # NAT64 mode: Pool4 with custom port ranges
-  %(prog)s --mode nat64 --pool4 "192.0.2.0/24:tcp,udp:49152-65535"
-
-  # NAT64 mode: From environment variable (comma-separated)
-  JOOL_POOL4="192.0.2.0/24,203.0.113.1" %(prog)s --mode nat64
+  # NAT64 mode: Multiple pools, custom port and ICMP ID ranges
+  %(prog)s --mode nat64 --pool4 192.0.2.0/24 --pool4 198.51.100.0/24 \\
+           --pool4-protocols tcp udp icmp \\
+           --pool4-port-range 49152-65535 --icmp-id-range 49152-65535
 
   # Dry run to see what would change
-  %(prog)s --dry-run --mode siit /etc/jool/eam_config.yaml
+  %(prog)s --dry-run --mode nat64 --pool4 192.0.2.0/24 --pool4-protocols tcp udp icmp
         """
     )
     parser.add_argument(
@@ -1011,18 +1039,37 @@ Examples:
     parser.add_argument(
         '--pool4',
         action='append',
-        help='IPv4 pool for NAT64 (can be specified multiple times). Format: "address" or "address:protocols" or "address:protocols:ports"'
+        dest='pool4',
+        metavar='ADDRESS',
+        help=(
+            'IPv4 pool address or prefix (e.g. "192.0.2.0/24"). '
+            'Repeat the flag to configure multiple addresses: --pool4 A --pool4 B. '
+            'Can also be set via JOOL_POOL4 as a comma-separated list.'
+        )
     )
     parser.add_argument(
         '--pool4-protocols',
         nargs='+',
         choices=['tcp', 'udp', 'icmp'],
-        help='Default protocols for pool4 entries (default: tcp udp)'
+        help=(
+            'Protocols for every pool4 address (default: tcp udp). '
+            'Include "icmp" to translate ICMP Echo (ping) via Identifier mapping.'
+        )
     )
     parser.add_argument(
         '--pool4-port-range',
         default='1-65535',
-        help='Default port range for pool4 TCP/UDP (default: 1-65535)'
+        help='Port range for pool4 TCP/UDP entries (default: 1-65535)'
+    )
+    parser.add_argument(
+        '--icmp-id-range',
+        default='0-65535',
+        help=(
+            'ICMP Identifier range for pool4 ICMP entries (default: 0-65535). '
+            'Values must be 16-bit unsigned integers in [0, 65535]. '
+            'Only applied when "icmp" is in --pool4-protocols. '
+            'Can also be set via JOOL_ICMP_ID_RANGE.'
+        )
     )
     parser.add_argument(
         '--no-pool6',
@@ -1048,11 +1095,12 @@ Examples:
     # Determine mode
     mode = args.mode or os.environ.get('JOOL_MODE', 'siit')
 
-    # Get configuration from args or environment
+    # ----------------------------------------------------------------
+    # SIIT-specific configuration
+    # ----------------------------------------------------------------
     if mode == 'siit':
         config_path = args.config or os.environ.get('EAM_CONFIG_FILE')
 
-        # Instance name priority: --instance > --siit-instance > JOOL_INSTANCE_SIIT > default
         if args.instance:
             instance_name = args.instance
         elif args.siit_instance:
@@ -1061,11 +1109,17 @@ Examples:
             instance_name = os.environ.get('JOOL_INSTANCE_SIIT', 'defaultnat46')
 
         default_pool6 = os.environ.get('JOOL_POOL6')  # Optional for SIIT
-        pool4_entries = []  # SIIT doesn't use pool4
-    else:  # nat64
+        pool4: List[str] = []
+        pool4_protocols: List[str] = []
+        pool4_port_range = '1-65535'
+        icmp_id_range = '0-65535'
+
+    # ----------------------------------------------------------------
+    # NAT64-specific configuration
+    # ----------------------------------------------------------------
+    else:
         config_path = None  # NAT64 doesn't use EAM config
 
-        # Instance name priority: --instance > --nat64-instance > JOOL_INSTANCE_NAT64 > default
         if args.instance:
             instance_name = args.instance
         elif args.nat64_instance:
@@ -1075,91 +1129,109 @@ Examples:
 
         default_pool6 = os.environ.get('JOOL_POOL6', '64:ff9b::/96')  # Required for NAT64
 
-        # Pool4 for NAT64 - support multiple entries
-        pool4_list = args.pool4 or []
+        # Pool4: CLI (--pool4 repeated) takes priority over env var (comma-separated)
+        pool4_from_cli: List[str] = args.pool4 or []
+        pool4_from_env: List[str] = [
+            addr.strip().strip("'").strip('"')
+            for addr in os.environ.get('JOOL_POOL4', '').split(',')
+            if addr.strip()
+        ]
+        pool4 = pool4_from_cli if pool4_from_cli else pool4_from_env
 
-        # Also check environment variable (comma-separated)
-        env_pool4 = os.environ.get('JOOL_POOL4')
-        if env_pool4 and not pool4_list:
-            pool4_list = [p.strip() for p in env_pool4.split(',') if p.strip()]
-
-        # Pool4 protocols (default: tcp, udp)
-        pool4_protocols = args.pool4_protocols
+        # Pool4 protocols
+        pool4_protocols = args.pool4_protocols or []
         if not pool4_protocols:
-            # Check environment variable
-            env_protocols = os.environ.get('JOOL_POOL4_PROTOCOLS')
-            if env_protocols:
-                pool4_protocols = [p.strip().lower() for p in env_protocols.split(',')]
-            else:
-                pool4_protocols = ['tcp', 'udp']
+            env_protocols = os.environ.get('JOOL_POOL4_PROTOCOLS', '')
+            pool4_protocols = (
+                [p.strip().lower() for p in env_protocols.split(',') if p.strip()]
+                if env_protocols else ['tcp', 'udp']
+            )
 
-        # Pool4 port range
+        # Validate protocol names coming from env var (argparse handles CLI)
+        valid_protocols = {'tcp', 'udp', 'icmp'}
+        for proto in pool4_protocols:
+            if proto not in valid_protocols:
+                logger.error(
+                    f"Invalid protocol '{proto}'. Must be one of: {', '.join(sorted(valid_protocols))}"
+                )
+                sys.exit(1)
+
+        # Port range for TCP/UDP
         pool4_port_range = args.pool4_port_range or os.environ.get('JOOL_POOL4_PORT_RANGE', '1-65535')
 
-        # Parse pool4 entries
-        pool4_entries = parse_pool4_entries(pool4_list, pool4_protocols, pool4_port_range)
+        # ICMP ID range
+        icmp_id_range = args.icmp_id_range or os.environ.get('JOOL_ICMP_ID_RANGE', '0-65535')
+        if 'icmp' in pool4_protocols:
+            try:
+                validate_icmp_id_range(icmp_id_range)
+            except ValueError as e:
+                logger.error(f"Invalid ICMP ID range '{icmp_id_range}': {e}")
+                sys.exit(1)
 
-    # Handle pool6
+    # ----------------------------------------------------------------
+    # Pool6
+    # ----------------------------------------------------------------
     if args.no_pool6:
         pool6 = None
     else:
         pool6 = args.pool6 or default_pool6
-        # Strip any surrounding quotes that might have been added accidentally
         if pool6:
             pool6 = pool6.strip().strip("'").strip('"')
 
-    # Validate config for SIIT mode
+    # ----------------------------------------------------------------
+    # Validate required parameters
+    # ----------------------------------------------------------------
     if mode == 'siit' and not config_path:
         logger.error("SIIT mode requires a configuration file. Use argument or EAM_CONFIG_FILE env var.")
         sys.exit(1)
 
+    # ----------------------------------------------------------------
+    # Execute
+    # ----------------------------------------------------------------
     try:
         logger.info("=" * 60)
         logger.info(f"Jool {mode.upper()} Manager")
-        logger.info(f"Mode: {mode.upper()}")
+        logger.info(f"Mode:     {mode.upper()}")
         logger.info(f"Instance: {instance_name}")
-        if pool6:
-            logger.info(f"Pool6: {pool6}")
-        else:
-            logger.info("Pool6: None (EAM only)")
-        if mode == 'nat64' and pool4_entries:
-            logger.info(f"Pool4 entries: {len(pool4_entries)}")
-            for entry in pool4_entries:
-                logger.info(f"  - {entry}")
+        logger.info(f"Pool6:    {pool6 or 'None (EAM only)'}")
+        if mode == 'nat64':
+            if pool4:
+                logger.info(f"Pool4:    {', '.join(pool4)}")
+                logger.info(f"Protocols:{' ' + ', '.join(pool4_protocols)}")
+                if any(p in pool4_protocols for p in ('tcp', 'udp')):
+                    logger.info(f"Port range:    {pool4_port_range}")
+                if 'icmp' in pool4_protocols:
+                    logger.info(f"ICMP ID range: {icmp_id_range}")
+            else:
+                logger.info("Pool4:    not configured")
         if config_path:
-            logger.info(f"Config: {config_path}")
+            logger.info(f"Config:   {config_path}")
         if args.dry_run:
-            logger.info("Mode: DRY RUN")
+            logger.info("*** DRY RUN – no changes will be made ***")
         logger.info("=" * 60)
 
+        # ---- SIIT ----
         if mode == 'siit':
-            # SIIT mode with EAM management
             manager = JoolSIITManager(
                 instance_name=instance_name,
                 pool6=pool6,
                 dry_run=args.dry_run
             )
-
-            # Setup instance
             manager.setup()
 
-            # Load desired mappings from config
             desired_mappings = manager.load_config(config_path)
-
-            # Sync mappings (idempotent)
             added, removed, unchanged = manager.sync_mappings(desired_mappings)
 
-            # Summary
             logger.info("=" * 60)
-            logger.info("Synchronization complete!")
+            logger.info("EAM synchronization complete!")
             logger.info(f"  Added:     {added}")
             logger.info(f"  Removed:   {removed}")
             logger.info(f"  Unchanged: {unchanged}")
             logger.info(f"  Total:     {added + unchanged}")
             logger.info("=" * 60)
 
-        else:  # nat64
-            # NAT64 mode (no EAM)
+        # ---- NAT64 ----
+        else:
             if not pool6:
                 logger.error("NAT64 mode requires pool6 to be specified")
                 sys.exit(1)
@@ -1167,21 +1239,27 @@ Examples:
             manager = JoolNAT64Manager(
                 instance_name=instance_name,
                 pool6=pool6,
-                pool4_entries=pool4_entries,
+                pool4=pool4,
+                pool4_protocols=pool4_protocols,
+                pool4_port_range=pool4_port_range,
+                icmp_id_range=icmp_id_range,
                 dry_run=args.dry_run
             )
 
-            # Setup instance (includes pool4 sync)
-            manager.setup()
+            p4_added, p4_removed, p4_unchanged = manager.setup()
 
             logger.info("=" * 60)
             logger.info("NAT64 instance setup complete!")
-            if pool4_entries:
-                logger.info(f"Pool4 entries configured: {len(pool4_entries)}")
+            if pool4:
+                logger.info("Pool4 synchronization:")
+                logger.info(f"  Added:     {p4_added}")
+                logger.info(f"  Removed:   {p4_removed}")
+                logger.info(f"  Unchanged: {p4_unchanged}")
+                logger.info(f"  Total:     {p4_added + p4_unchanged}")
             logger.info("=" * 60)
 
         if args.dry_run:
-            logger.info("DRY RUN mode - no changes were made")
+            logger.info("DRY RUN mode – no changes were made")
 
         sys.exit(0)
 
