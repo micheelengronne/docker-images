@@ -534,6 +534,12 @@ class JoolSIITManager:
         """Complete setup: create SIIT instance if absent."""
         self.create_instance()
 
+        self.logger.info(f"Enabling jool_siit instance '{self.instance_name}' (manually-enabled)")
+        self.run_command([
+            "jool_siit", "-i", self.instance_name,
+            "global", "update", "manually-enabled", "true"
+        ])
+
 
 # ---------------------------------------------------------------------------
 # NAT64 manager
@@ -917,6 +923,13 @@ class JoolNAT64Manager:
         self.create_instance()
 
         desired = self.build_desired_pool4_entries()
+
+        self.logger.info(f"Enabling jool instance '{self.instance_name}' (manually-enabled)")
+        self.run_command([
+            "jool", "-i", self.instance_name,
+            "global", "update", "manually-enabled", "true"
+        ])
+
         if desired:
             return self.sync_pool4(desired)
         return 0, 0, 0
