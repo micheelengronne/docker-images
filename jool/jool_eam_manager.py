@@ -5,7 +5,6 @@ Jool SIIT/NAT64 EAM (Explicit Address Mapping) Manager
 This script manages Jool SIIT and NAT64 instances and IPv4-IPv6 EAM mappings in an idempotent manner.
 
 Features:
-- Sets up kernel modules (jool, jool_siit)
 - Creates Jool SIIT or NAT64 instance if not exists
 - Manages EAM mappings from YAML configuration (SIIT mode only)
 - Idempotent: removes mappings not in config, adds missing ones
