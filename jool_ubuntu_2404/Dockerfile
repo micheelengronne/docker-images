@@ -9,6 +9,7 @@ ADD "https://github.com/NICMx/Jool/releases/download/v${JOOL_VERSION}/jool-dkms_
 ADD "https://github.com/NICMx/Jool/releases/download/v${JOOL_VERSION}/jool-tools_${JOOL_VERSION}-1_amd64.deb" /usr/local/src/jool-tools.deb
 
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y /usr/local/src/jool-dkms.deb /usr/local/src/jool-tools.deb --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
