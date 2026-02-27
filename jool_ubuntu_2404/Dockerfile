@@ -10,7 +10,7 @@ ADD "https://github.com/NICMx/Jool/releases/download/v${JOOL_VERSION}/jool-tools
 
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y /usr/local/src/jool-dkms.deb /usr/local/src/jool-tools.deb --no-install-recommends \
+    && apt-get install -y libc6 libnl-3-200 libnl-genl-3-200 /usr/local/src/jool-dkms.deb /usr/local/src/jool-tools.deb --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
