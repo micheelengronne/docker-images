@@ -21,5 +21,4 @@ echo 'jool kernel module is enabled'
 modprobe jool_siit
 echo 'jool_siit kernel module is enabled'
 
-# Set the python script as a CMD
 "$@"

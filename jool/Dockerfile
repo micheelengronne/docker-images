@@ -1,4 +1,4 @@
-FROM docker.io/python:3.13.7-trixie
+FROM docker.io/debian:12.13-slim
 
 LABEL org.opencontainers.image.description="Jool image for nat64 and siit"
 
@@ -17,9 +17,5 @@ RUN apt-get update \
     && mv /usr/local/src/build/jool-* /usr/local/src/build/jool
 
 COPY --chmod=555 jool/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY --chmod=555 jool/jool_eam_manager.py /usr/local/bin/jool_eam_manager.py
-
-COPY jool/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
 
 ENTRYPOINT [ "entrypoint.sh" ]
