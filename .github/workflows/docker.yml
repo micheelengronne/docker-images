@@ -60,7 +60,8 @@ jobs:
             org.opencontainers.image.vendor=${{ github.repository_owner }}
           context: .
           file: ${{ matrix.image }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # Due to jool-tools being only available for amd, arm is temporarily disabled
+          platforms: linux/amd64  #,linux/arm64
           provenance: mode=max
           sbom: true
           push: true
