@@ -1,4 +1,4 @@
-FROM docker.io/debian:12.13-slim
+FROM docker.io/debian:13.13-slim
 
 LABEL org.opencontainers.image.description="Jool image for nat64 and siit"
 
