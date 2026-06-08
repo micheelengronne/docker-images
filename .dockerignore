@@ -4,3 +4,4 @@
 !jool/requirements.txt
 !jool/jool_eam_manager.py
 !jool_ubuntu_2404/entrypoint.sh
+!jool_debian_135/entrypoint.sh
