@@ -1,4 +1,5 @@
-FROM docker.io/debian:13.5
+# To have the widest range of kernels we use backports
+FROM docker.io/debian:trixie-backports
 
 LABEL org.opencontainers.image.description="Jool image for nat64 and siit"
 
