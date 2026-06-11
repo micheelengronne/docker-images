@@ -11,7 +11,7 @@ ADD "https://github.com/NICMx/Jool/releases/download/v${JOOL_VERSION}/jool-tools
 
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y /usr/local/src/jool-dkms.deb /usr/local/src/jool-tools.deb --no-install-recommends \
+    && apt-get install -y openssl /usr/local/src/jool-dkms.deb /usr/local/src/jool-tools.deb --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
