@@ -4,9 +4,9 @@
 #
 #    pip-compile --generate-hashes requirements.in
 #
-jool-exporter==26.2.3 \
-    --hash=sha256:d78439ca34099c9a3abba9f0dce7986107ed968ea02e61ec2de9002352c0322b \
-    --hash=sha256:e2673417c339da065561cc6c3735c06337c842bfb7d9df0ac5da1b515135da18
+jool-exporter==26.2.27.post3 \
+    --hash=sha256:cb384433d90cbaa68c8af3b1f332f38d3deee9928f58684ee20462150a85fea3 \
+    --hash=sha256:e3746897a1cb22c2d84eb6dfbb5bc28fc6d3bc049d3b33b5887488659bb05b71
     # via -r requirements.in
 prometheus-client==0.23.1 \
     --hash=sha256:6ae8f9081eaaaf153a2e959d2e6c4f4fb57b12ef76c8c7980202f1e57b48b2ce \
